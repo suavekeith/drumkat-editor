@@ -1,0 +1,10 @@
+# SysEx dumps (personal hardware data)
+*.syx
+
+# PDF manual
+*.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
