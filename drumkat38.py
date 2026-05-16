@@ -97,7 +97,9 @@ MODE_NAMES = [
 
 KAT_MANUFACTURER = (0x00, 0x00, 0x15)
 DRUMKAT_INSTRUMENT_ID = 0x68
-DUMP_TYPE_KIT = 0x10
+DUMP_TYPE_KIT      = 0x10
+DUMP_TYPE_ALL_KITS = 0x12
+NUM_KITS = 30
 
 HEADER_SIZE = 118       # internal bytes before first pad block
 BLOCK_SIZE = 25         # internal bytes per pad/trigger block
@@ -551,6 +553,75 @@ def load_kit(path: str) -> Kit:
 def save_kit(kit: Kit, path: str):
     with open(path, 'wb') as f:
         f.write(kit.to_sysex())
+
+
+# ---------------------------------------------------------------------------
+# Kit bank (All Kits dump — 30 kits)
+# ---------------------------------------------------------------------------
+
+KIT_SIZE = 592   # internal bytes per kit (= 1184 nibble bytes)
+
+class KitBank:
+    """Holds all 30 kits from an All Kits SysEx dump."""
+
+    def __init__(self, header: SysExHeader, internal: list[int]):
+        self.sysex_header = header
+        assert len(internal) == NUM_KITS * KIT_SIZE, \
+            f'Expected {NUM_KITS * KIT_SIZE} bytes, got {len(internal)}'
+        self.kits: list[Kit] = []
+        for i in range(NUM_KITS):
+            block = internal[i * KIT_SIZE:(i + 1) * KIT_SIZE]
+            # Build a minimal SysExHeader for each kit slot
+            slot_header = SysExHeader(DUMP_TYPE_KIT, header.instrument_id,
+                                      header.sw_version, i)
+            self.kits.append(Kit(slot_header, block))
+
+    def kit(self, n: int) -> Kit:
+        """1-based kit access: kit(1) .. kit(30)."""
+        assert 1 <= n <= NUM_KITS
+        return self.kits[n - 1]
+
+    def to_internal(self) -> list[int]:
+        data = []
+        for k in self.kits:
+            data.extend(k.to_internal())
+        return data
+
+    def to_sysex(self) -> bytes:
+        internal = self.to_internal()
+        h = self.sysex_header
+        header = bytes([
+            0xF0,
+            *KAT_MANUFACTURER,
+            DRUMKAT_INSTRUMENT_ID,
+            h.dump_type,
+            h.instrument_id,
+            h.sw_version,
+            h.aux,
+        ])
+        return header + _encode_nibbles(internal) + bytes([0xF7])
+
+    def __repr__(self):
+        lines = ['KitBank (30 kits):']
+        for i, k in enumerate(self.kits):
+            lines.append(f'  [{i+1:2d}] {k.name}')
+        return '\n'.join(lines)
+
+
+def load_kit_bank(path: str) -> KitBank:
+    with open(path, 'rb') as f:
+        raw = f.read()
+    assert raw[0] == 0xF0 and raw[-1] == 0xF7, 'Invalid SysEx file'
+    header = parse_sysex_header(raw)
+    assert header.dump_type == DUMP_TYPE_ALL_KITS, \
+        f'Expected All Kits dump (0x{DUMP_TYPE_ALL_KITS:02X}), got 0x{header.dump_type:02X}'
+    internal = _decode_nibbles(raw[9:-1])
+    return KitBank(header, internal)
+
+
+def save_kit_bank(bank: KitBank, path: str):
+    with open(path, 'wb') as f:
+        f.write(bank.to_sysex())
 
 
 # ---------------------------------------------------------------------------
