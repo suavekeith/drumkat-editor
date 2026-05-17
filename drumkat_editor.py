@@ -5,7 +5,7 @@ import rtmidi
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QSplitter, QListWidget, QListWidgetItem, QLabel,
-    QLineEdit, QSpinBox, QComboBox, QGroupBox, QScrollArea,
+    QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QGroupBox, QScrollArea,
     QFileDialog, QMessageBox, QFrame, QPushButton,
 )
 from PyQt6.QtCore import Qt, QTimer
@@ -16,6 +16,8 @@ from drumkat38 import (
     parse_sysex_header, DUMP_TYPE_KIT, DUMP_TYPE_ALL_KITS,
     SURFACES, MODE_NAMES, CONTROL_TYPE_NAMES, GATE_TABLE,
     note_name, NUM_SURFACES, NUM_KITS,
+    MIDI_PORT_NAMES, MODES_WITH_PORT,
+    TEMPO_MIN, TEMPO_MAX,
 )
 
 
@@ -408,6 +410,13 @@ class SurfacePanel(QWidget):
         self.w_gate.currentIndexChanged.connect(self._on_gate_changed)
         form.addRow('Gate Time:', self.w_gate)
 
+        # MIDI Port (not available in Simple or Control mode)
+        self.w_midi_port = QComboBox()
+        self.w_midi_port.addItems(MIDI_PORT_NAMES)
+        self.w_midi_port.currentIndexChanged.connect(self._on_midi_port_setting_changed)
+        self.l_midi_port = QLabel('MIDI Port:')
+        form.addRow(self.l_midi_port, self.w_midi_port)
+
         # Control Type (Control mode only)
         self.w_control_type = QComboBox()
         self.w_control_type.addItems(CONTROL_TYPE_NAMES)
@@ -495,6 +504,7 @@ class SurfacePanel(QWidget):
         self.w_vel_min.setCurrentIndex(VEL_MIN_VALUES.index(surface.vel_min))
         self.w_vel_max.setCurrentIndex(VEL_MAX_VALUES.index(surface.vel_max))
         self.w_gate.setCurrentIndex(surface.gate)
+        self.w_midi_port.setCurrentIndex(surface.midi_port)
 
         self.w_link.blockSignals(True)
         self.w_link.clear()
@@ -530,6 +540,8 @@ class SurfacePanel(QWidget):
         self.notes_group.hide()
         self.l_control_type.hide()
         self.w_control_type.hide()
+        self.l_midi_port.hide()
+        self.w_midi_port.hide()
 
     @staticmethod
     def _set_note(spin, label, midi_note):
@@ -548,6 +560,10 @@ class SurfacePanel(QWidget):
 
         self.l_control_type.setVisible(is_control)
         self.w_control_type.setVisible(is_control)
+
+        has_port = mode in MODES_WITH_PORT
+        self.l_midi_port.setVisible(has_port)
+        self.w_midi_port.setVisible(has_port)
 
         if is_control:
             self.notes_group.hide()
@@ -601,6 +617,10 @@ class SurfacePanel(QWidget):
     def _on_control_type_changed(self, idx):
         if self._loading or self._surface is None: return
         self._surface.control_type = idx
+
+    def _on_midi_port_setting_changed(self, idx):
+        if self._loading or self._surface is None: return
+        self._surface.midi_port = idx
 
     def _on_link_changed(self, idx):
         if self._loading or self._surface is None: return
@@ -678,6 +698,19 @@ class MainWindow(QMainWindow):
         self.w_kit_name.textEdited.connect(self._on_name_edited)
         top_layout.addWidget(lbl_name)
         top_layout.addWidget(self.w_kit_name)
+
+        lbl_tempo = QLabel('Tempo:')
+        lbl_tempo.setStyleSheet('color: #9d9d9d;')
+        self.w_tempo = QDoubleSpinBox()
+        self.w_tempo.setRange(TEMPO_MIN, TEMPO_MAX)
+        self.w_tempo.setDecimals(1)
+        self.w_tempo.setSingleStep(1.0)
+        self.w_tempo.setSuffix(' BPM')
+        self.w_tempo.setFixedWidth(100)
+        self.w_tempo.setEnabled(False)
+        self.w_tempo.valueChanged.connect(self._on_tempo_changed)
+        top_layout.addWidget(lbl_tempo)
+        top_layout.addWidget(self.w_tempo)
         top_layout.addStretch()
 
         lbl_midi = QLabel('MIDI Out:')
@@ -826,6 +859,9 @@ class MainWindow(QMainWindow):
             return
         self._kit = self._bank.kits[idx]
         self.w_kit_name.setText(self._kit.name)
+        self.w_tempo.blockSignals(True)
+        self.w_tempo.setValue(self._kit.tempo)
+        self.w_tempo.blockSignals(False)
         row = self.surface_list.currentRow()
         self._on_surface_selected(row if row >= 0 else 0)
 
@@ -880,6 +916,10 @@ class MainWindow(QMainWindow):
 
         self.w_kit_name.setEnabled(True)
         self.w_kit_name.setText(self._kit.name)
+        self.w_tempo.setEnabled(True)
+        self.w_tempo.blockSignals(True)
+        self.w_tempo.setValue(self._kit.tempo)
+        self.w_tempo.blockSignals(False)
         if self.surface_list.currentRow() == 0:
             self._on_surface_selected(0)
         else:
@@ -902,6 +942,11 @@ class MainWindow(QMainWindow):
             self.w_kit_selector.blockSignals(True)
             self.w_kit_selector.setItemText(idx, f'{idx+1:2d}.  {text}')
             self.w_kit_selector.blockSignals(False)
+        self._mark_unsaved()
+
+    def _on_tempo_changed(self, value):
+        if self._kit is None: return
+        self._kit.tempo = value
         self._mark_unsaved()
 
     def _mark_unsaved(self):

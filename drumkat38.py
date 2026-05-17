@@ -8,15 +8,16 @@ Confirmed byte map (from live diffing, May 2026):
       mode encoding: nibble-swapped index  (0x00=Simple, 0x10=Multiple, ...)
     header[31..49]: link target per surface; nibble-swap encoded surface index; 0xFF = no link
 
-  Pad blocks: 19 x 25 internal bytes starting at internal offset 118
+  Surface blocks: 19 surfaces, each occupying 25 bytes:
+    port byte at internal offset 117 + n*25 (Both=0xFF, None=0xCF, Right=0xDF, Left=0xEF)
+    24 data bytes at internal offset 118 + n*25:
     Surfaces: Pad 1-10 (index 0-9), Trigger 1-9 (index 10-18)
-    block_start = 118 + pad_index * 25   (pad_index 0-based)
     +0  MIDI channel   stored = channel - 1  (0=ch1, 9=ch10, ...)
     +1  MIDI note      nibble-swapped: stored = ((note&0xF)<<4)|(note>>4)
     +2  Velocity       stored = vel*2 + 15;  range 0-120
     +3..+22  partially mapped:
       +7, +9, +19  additional note slots for Multiple mode (notes 2, 3, 4)
-    +23..+24  0x30 0xFF  block terminator
+    +23  0x30  block terminator
 
 SysEx header (9 bytes):
   F0 00 00 15 68 TT II VV AX
@@ -101,14 +102,19 @@ DUMP_TYPE_KIT      = 0x10
 DUMP_TYPE_ALL_KITS = 0x12
 NUM_KITS = 30
 
-HEADER_SIZE = 118       # internal bytes before first pad block
-BLOCK_SIZE = 25         # internal bytes per pad/trigger block
+HEADER_SIZE = 117       # internal bytes of true kit header (bytes 0-116)
+BLOCK_SIZE = 24         # internal data bytes per surface (excludes port byte)
+# Each surface occupies 25 bytes total: 1 port byte + 24 data bytes
+# Port byte for surface[n] is at internal offset 117 + n*25
 NUM_SURFACES = 19
 
 NAME_OFFSET = 0         # header bytes 0-11: kit name, nibble-swapped ASCII, space-padded
 NAME_LENGTH = 12
 MODE_BASE_OFFSET = 12   # header bytes 12-30: mode byte per surface, nibble-swap encoded
 LINK_BASE_OFFSET = 31   # header bytes 31-49: link target per surface, nibble-swap encoded surface index; 0xFF = no link
+TEMPO_OFFSET = 66       # header byte 66: tempo, stored as nibble_swap(round(10000/BPM))
+TEMPO_MIN = 30.0        # minimum displayable BPM
+TEMPO_MAX = 250.0       # maximum displayable BPM
 
 # Offsets within each 25-byte block
 OFF_CHANNEL      = 0
@@ -125,6 +131,25 @@ OFF_NOTE8        = 17   # note 8
 # Control mode repurposes block+5 for control type (overlaps with OFF_NOTE2)
 OFF_CONTROL_TYPE = 5    # stored = nibble_swap(control_type_index + CONTROL_TYPE_OFFSET)
 CONTROL_TYPE_OFFSET = 5 # hardware internal index of CONTROL_TYPE_NAMES[0]
+
+MIDI_PORT_NAMES  = ['Both', 'None', 'Right', 'Left']
+MIDI_PORT_VALUES = [0xFF, 0xCF, 0xDF, 0xEF]  # confirmed from live dumps
+# Only available in modes other than Simple (0) and Control (16)
+MODES_WITH_PORT = set(range(1, 16))  # modes 1-15
+
+
+def encode_midi_port(idx: int) -> int:
+    """idx is 0-based index into MIDI_PORT_NAMES."""
+    assert 0 <= idx < len(MIDI_PORT_NAMES)
+    return MIDI_PORT_VALUES[idx]
+
+
+def decode_midi_port(stored: int) -> int:
+    """Returns 0-based index into MIDI_PORT_NAMES, or 0 (Both) if unrecognised."""
+    try:
+        return MIDI_PORT_VALUES.index(stored)
+    except ValueError:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -271,11 +296,12 @@ def parse_sysex_header(raw: bytes) -> SysExHeader:
 # ---------------------------------------------------------------------------
 
 class Surface:
-    def __init__(self, index: int, name: str, raw_block: list[int], kit_header: list[int]):
+    def __init__(self, index: int, name: str, raw_block: list[int], kit_header: list[int], ports: list[int]):
         self.index = index
         self.name  = name
-        self._block = list(raw_block)       # 25 raw internal bytes
+        self._block = list(raw_block)       # 24 data bytes
         self._kit_header = kit_header       # shared reference to Kit._header_bytes
+        self._ports = ports                 # shared reference to Kit._ports
 
     @property
     def mode(self) -> int:
@@ -332,6 +358,19 @@ class Surface:
     def link_name(self) -> str | None:
         idx = self.link
         return SURFACES[idx] if idx is not None else None
+
+    @property
+    def midi_port(self) -> int:
+        """0-based index into MIDI_PORT_NAMES. Only meaningful when mode is in MODES_WITH_PORT."""
+        return decode_midi_port(self._ports[self.index])
+
+    @midi_port.setter
+    def midi_port(self, idx: int):
+        self._ports[self.index] = encode_midi_port(idx)
+
+    @property
+    def midi_port_name(self) -> str:
+        return MIDI_PORT_NAMES[self.midi_port]
 
     @property
     def control_type(self) -> int:
@@ -464,6 +503,8 @@ class Surface:
                      f' note6={self.note6}({note_name(self.note6)})'
                      f' note7={self.note7}({note_name(self.note7)})'
                      f' note8={self.note8}({note_name(self.note8)})')
+        if self.mode in MODES_WITH_PORT:
+            base += f' port={self.midi_port_name}'
         if self.mode == 16:  # Control
             base += f' control_type={self.control_type_name}'
         if self.link is not None:
@@ -479,14 +520,16 @@ class Kit:
     def __init__(self, header: SysExHeader, internal: list[int]):
         self.sysex_header = header
         self._internal_size = len(internal)     # preserve original byte count
-        self._header_bytes = list(internal[:HEADER_SIZE])
+        self._header_bytes = list(internal[:HEADER_SIZE])   # bytes 0-116
+        # Port byte for surface[n] at internal offset 117 + n*25
+        self._ports = [internal[117 + i * 25] for i in range(NUM_SURFACES)]
         self.surfaces: list[Surface] = []
         for i, name in enumerate(SURFACES):
-            start = HEADER_SIZE + i * BLOCK_SIZE
-            block = internal[start:start + BLOCK_SIZE]
+            start = 118 + i * 25          # data bytes start after port byte
+            block = internal[start:start + BLOCK_SIZE]   # 24 data bytes
             if len(block) < BLOCK_SIZE:
                 block += [0xFF] * (BLOCK_SIZE - len(block))
-            self.surfaces.append(Surface(i, name, block, self._header_bytes))
+            self.surfaces.append(Surface(i, name, block, self._header_bytes, self._ports))
 
     def pad(self, n: int) -> Surface:
         """1-based pad access: pad(1) .. pad(10)."""
@@ -499,10 +542,11 @@ class Kit:
         return self.surfaces[9 + n]
 
     def to_internal(self) -> list[int]:
-        data = list(self._header_bytes)
-        for s in self.surfaces:
-            data.extend(s.raw())
-        return data[:self._internal_size]   # preserve original length
+        data = list(self._header_bytes)     # 117 bytes (0-116)
+        for i, s in enumerate(self.surfaces):
+            data.append(self._ports[i])     # port byte at 117 + i*25
+            data.extend(s.raw())            # 24 data bytes at 118 + i*25
+        return data[:self._internal_size]
 
     def to_sysex(self) -> bytes:
         internal = self.to_internal()
@@ -528,6 +572,23 @@ class Kit:
         padded = value[:NAME_LENGTH].ljust(NAME_LENGTH)
         for i, ch in enumerate(padded):
             self._header_bytes[NAME_OFFSET + i] = _swap_nibbles(ord(ch))
+
+    @property
+    def tempo(self) -> float:
+        """Kit tempo in BPM.  Formula: BPM = 10000 / nibble_swap(h[66]).
+        Returns a float rounded to 1 decimal place (e.g. 94.3, 109.9, 120.5)."""
+        stored = _swap_nibbles(self._header_bytes[TEMPO_OFFSET])
+        if stored == 0:
+            return TEMPO_MIN
+        return round(10000 / stored, 1)
+
+    @tempo.setter
+    def tempo(self, bpm: float):
+        """Set tempo in BPM.  Clamps to [TEMPO_MIN, TEMPO_MAX]."""
+        bpm = max(TEMPO_MIN, min(TEMPO_MAX, float(bpm)))
+        stored = round(10000 / bpm)
+        stored = max(1, min(255, stored))
+        self._header_bytes[TEMPO_OFFSET] = _swap_nibbles(stored)
 
     def __repr__(self):
         lines = [f'Kit "{self.name}" (sw=0x{self.sysex_header.sw_version:02X})']
