@@ -34,15 +34,21 @@ class MidiEngine:
     def __init__(self):
         self._out  = rtmidi.MidiOut()
         self._port = None          # currently open port index
-        self._pending: list[tuple[int,int]] = []   # (channel, note) awaiting Note Off
 
     def ports(self) -> list[str]:
         return self._out.get_ports()
+
+    def _all_notes_off(self):
+        """Send All-Notes-Off (CC 123) on all 16 channels to silence any stuck notes."""
+        if self._out.is_port_open():
+            for ch in range(16):
+                self._out.send_message([0xB0 | ch, 123, 0])
 
     def open(self, idx: int):
         if self._port == idx:
             return
         if self._out.is_port_open():
+            self._all_notes_off()
             self._out.close_port()
         ports = self.ports()
         if 0 <= idx < len(ports):
@@ -50,6 +56,7 @@ class MidiEngine:
             self._port = idx
 
     def close(self):
+        self._all_notes_off()
         if self._out.is_port_open():
             self._out.close_port()
         self._port = None
@@ -501,8 +508,11 @@ class SurfacePanel(QWidget):
         self.w_channel.setValue(surface.channel)
         self.w_curve.setValue(surface.curve)
         self._set_note(self.w_note, self.l_note, surface.note)
-        self.w_vel_min.setCurrentIndex(VEL_MIN_VALUES.index(surface.vel_min))
-        self.w_vel_max.setCurrentIndex(VEL_MAX_VALUES.index(surface.vel_max))
+        # Use get() via dict to avoid ValueError on unusual stored bytes
+        vmin_idx = VEL_MIN_VALUES.index(surface.vel_min) if surface.vel_min in VEL_MIN_VALUES else 0
+        vmax_idx = VEL_MAX_VALUES.index(surface.vel_max) if surface.vel_max in VEL_MAX_VALUES else len(VEL_MAX_VALUES) - 1
+        self.w_vel_min.setCurrentIndex(vmin_idx)
+        self.w_vel_max.setCurrentIndex(vmax_idx)
         self.w_gate.setCurrentIndex(surface.gate)
         self.w_midi_port.setCurrentIndex(surface.midi_port)
 
@@ -947,6 +957,14 @@ class MainWindow(QMainWindow):
     def _on_tempo_changed(self, value):
         if self._kit is None: return
         self._kit.tempo = value
+        # Snap the spinbox to the actually-stored value so the display always
+        # reflects what will be written to the hardware (integer quantisation
+        # means 120.0 BPM stores as 120.5, etc.)
+        canonical = self._kit.tempo
+        if canonical != value:
+            self.w_tempo.blockSignals(True)
+            self.w_tempo.setValue(canonical)
+            self.w_tempo.blockSignals(False)
         self._mark_unsaved()
 
     def _mark_unsaved(self):

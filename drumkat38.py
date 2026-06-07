@@ -157,9 +157,15 @@ def decode_midi_port(stored: int) -> int:
 # ---------------------------------------------------------------------------
 
 def _decode_nibbles(payload: bytes) -> list[int]:
-    """Convert nibble-encoded SysEx payload to internal bytes."""
+    """Convert nibble-encoded SysEx payload to internal bytes.
+    Each internal byte is stored as two SysEx bytes (high nibble, low nibble).
+    Raises ValueError if payload length is odd (malformed SysEx)."""
+    if len(payload) % 2 != 0:
+        raise ValueError(
+            f'SysEx payload length is odd ({len(payload)}); '
+            'expected even-length nibble pairs')
     out = []
-    for i in range(0, len(payload) - 1, 2):
+    for i in range(0, len(payload), 2):
         hi = payload[i] & 0x0F
         lo = payload[i + 1] & 0x0F
         out.append((hi << 4) | lo)
@@ -243,8 +249,10 @@ def encode_gate(gate_index: int) -> int:
 
 
 def decode_gate(stored: int) -> int:
-    """Returns gate table index (0=LATCH, 1-253=seconds, 254=No OFF)."""
-    return _swap_nibbles(stored)
+    """Returns gate table index (0=LATCH, 1-253=seconds, 254=No OFF).
+    Clamps to 254 so that 0xFF padding in short blocks maps to No OFF
+    rather than crashing setCurrentIndex or encode_gate's range check."""
+    return min(_swap_nibbles(stored), GATE_NO_OFF)
 
 
 def gate_label(gate_index: int) -> str:
@@ -280,9 +288,14 @@ class SysExHeader:
 
 
 def parse_sysex_header(raw: bytes) -> SysExHeader:
-    assert raw[0] == 0xF0, 'Not a SysEx message'
-    assert raw[1:4] == bytes(KAT_MANUFACTURER), f'Unknown manufacturer: {raw[1:4].hex()}'
-    assert raw[4] == DRUMKAT_INSTRUMENT_ID, f'Unknown instrument: 0x{raw[4]:02X}'
+    if len(raw) < 9:
+        raise ValueError(f'SysEx file too short ({len(raw)} bytes)')
+    if raw[0] != 0xF0:
+        raise ValueError('Not a SysEx message (missing 0xF0)')
+    if raw[1:4] != bytes(KAT_MANUFACTURER):
+        raise ValueError(f'Unknown manufacturer: {raw[1:4].hex()}')
+    if raw[4] != DRUMKAT_INSTRUMENT_ID:
+        raise ValueError(f'Unknown instrument ID: 0x{raw[4]:02X}')
     return SysExHeader(
         dump_type     = raw[5],
         instrument_id = raw[6],
@@ -604,7 +617,8 @@ class Kit:
 def load_kit(path: str) -> Kit:
     with open(path, 'rb') as f:
         raw = f.read()
-    assert raw[0] == 0xF0 and raw[-1] == 0xF7, 'Invalid SysEx file'
+    if not raw or raw[0] != 0xF0 or raw[-1] != 0xF7:
+        raise ValueError('Invalid SysEx file (missing F0…F7 framing)')
     header  = parse_sysex_header(raw)
     payload = raw[9:-1]
     internal = _decode_nibbles(payload)
@@ -627,8 +641,11 @@ class KitBank:
 
     def __init__(self, header: SysExHeader, internal: list[int]):
         self.sysex_header = header
-        assert len(internal) == NUM_KITS * KIT_SIZE, \
-            f'Expected {NUM_KITS * KIT_SIZE} bytes, got {len(internal)}'
+        expected = NUM_KITS * KIT_SIZE
+        if len(internal) != expected:
+            raise ValueError(
+                f'All Kits dump size mismatch: expected {expected} bytes, '
+                f'got {len(internal)}')
         self.kits: list[Kit] = []
         for i in range(NUM_KITS):
             block = internal[i * KIT_SIZE:(i + 1) * KIT_SIZE]
@@ -672,10 +689,13 @@ class KitBank:
 def load_kit_bank(path: str) -> KitBank:
     with open(path, 'rb') as f:
         raw = f.read()
-    assert raw[0] == 0xF0 and raw[-1] == 0xF7, 'Invalid SysEx file'
+    if not raw or raw[0] != 0xF0 or raw[-1] != 0xF7:
+        raise ValueError('Invalid SysEx file (missing F0…F7 framing)')
     header = parse_sysex_header(raw)
-    assert header.dump_type == DUMP_TYPE_ALL_KITS, \
-        f'Expected All Kits dump (0x{DUMP_TYPE_ALL_KITS:02X}), got 0x{header.dump_type:02X}'
+    if header.dump_type != DUMP_TYPE_ALL_KITS:
+        raise ValueError(
+            f'Expected All Kits dump (0x{DUMP_TYPE_ALL_KITS:02X}), '
+            f'got 0x{header.dump_type:02X}')
     internal = _decode_nibbles(raw[9:-1])
     return KitBank(header, internal)
 
