@@ -8,15 +8,16 @@ Confirmed byte map (from live diffing, May 2026):
       mode encoding: nibble-swapped index  (0x00=Simple, 0x10=Multiple, ...)
     header[31..49]: link target per surface; nibble-swap encoded surface index; 0xFF = no link
 
-  Pad blocks: 19 x 25 internal bytes starting at internal offset 118
+  Surface blocks: 19 surfaces, each occupying 25 bytes:
+    port byte at internal offset 117 + n*25 (Both=0xFF, None=0xCF, Right=0xDF, Left=0xEF)
+    24 data bytes at internal offset 118 + n*25:
     Surfaces: Pad 1-10 (index 0-9), Trigger 1-9 (index 10-18)
-    block_start = 118 + pad_index * 25   (pad_index 0-based)
     +0  MIDI channel   stored = channel - 1  (0=ch1, 9=ch10, ...)
     +1  MIDI note      nibble-swapped: stored = ((note&0xF)<<4)|(note>>4)
     +2  Velocity       stored = vel*2 + 15;  range 0-120
     +3..+22  partially mapped:
       +7, +9, +19  additional note slots for Multiple mode (notes 2, 3, 4)
-    +23..+24  0x30 0xFF  block terminator
+    +23  0x30  block terminator
 
 SysEx header (9 bytes):
   F0 00 00 15 68 TT II VV AX
@@ -97,16 +98,23 @@ MODE_NAMES = [
 
 KAT_MANUFACTURER = (0x00, 0x00, 0x15)
 DRUMKAT_INSTRUMENT_ID = 0x68
-DUMP_TYPE_KIT = 0x10
+DUMP_TYPE_KIT      = 0x10
+DUMP_TYPE_ALL_KITS = 0x12
+NUM_KITS = 30
 
-HEADER_SIZE = 118       # internal bytes before first pad block
-BLOCK_SIZE = 25         # internal bytes per pad/trigger block
+HEADER_SIZE = 117       # internal bytes of true kit header (bytes 0-116)
+BLOCK_SIZE = 24         # internal data bytes per surface (excludes port byte)
+# Each surface occupies 25 bytes total: 1 port byte + 24 data bytes
+# Port byte for surface[n] is at internal offset 117 + n*25
 NUM_SURFACES = 19
 
 NAME_OFFSET = 0         # header bytes 0-11: kit name, nibble-swapped ASCII, space-padded
 NAME_LENGTH = 12
 MODE_BASE_OFFSET = 12   # header bytes 12-30: mode byte per surface, nibble-swap encoded
 LINK_BASE_OFFSET = 31   # header bytes 31-49: link target per surface, nibble-swap encoded surface index; 0xFF = no link
+TEMPO_OFFSET = 66       # header byte 66: tempo, stored as nibble_swap(round(10000/BPM))
+TEMPO_MIN = 30.0        # minimum displayable BPM
+TEMPO_MAX = 250.0       # maximum displayable BPM
 
 # Offsets within each 25-byte block
 OFF_CHANNEL      = 0
@@ -124,15 +132,40 @@ OFF_NOTE8        = 17   # note 8
 OFF_CONTROL_TYPE = 5    # stored = nibble_swap(control_type_index + CONTROL_TYPE_OFFSET)
 CONTROL_TYPE_OFFSET = 5 # hardware internal index of CONTROL_TYPE_NAMES[0]
 
+MIDI_PORT_NAMES  = ['Both', 'None', 'Right', 'Left']
+MIDI_PORT_VALUES = [0xFF, 0xCF, 0xDF, 0xEF]  # confirmed from live dumps
+# Only available in modes other than Simple (0) and Control (16)
+MODES_WITH_PORT = set(range(1, 16))  # modes 1-15
+
+
+def encode_midi_port(idx: int) -> int:
+    """idx is 0-based index into MIDI_PORT_NAMES."""
+    assert 0 <= idx < len(MIDI_PORT_NAMES)
+    return MIDI_PORT_VALUES[idx]
+
+
+def decode_midi_port(stored: int) -> int:
+    """Returns 0-based index into MIDI_PORT_NAMES, or 0 (Both) if unrecognised."""
+    try:
+        return MIDI_PORT_VALUES.index(stored)
+    except ValueError:
+        return 0
+
 
 # ---------------------------------------------------------------------------
 # Encoding helpers
 # ---------------------------------------------------------------------------
 
 def _decode_nibbles(payload: bytes) -> list[int]:
-    """Convert nibble-encoded SysEx payload to internal bytes."""
+    """Convert nibble-encoded SysEx payload to internal bytes.
+    Each internal byte is stored as two SysEx bytes (high nibble, low nibble).
+    Raises ValueError if payload length is odd (malformed SysEx)."""
+    if len(payload) % 2 != 0:
+        raise ValueError(
+            f'SysEx payload length is odd ({len(payload)}); '
+            'expected even-length nibble pairs')
     out = []
-    for i in range(0, len(payload) - 1, 2):
+    for i in range(0, len(payload), 2):
         hi = payload[i] & 0x0F
         lo = payload[i + 1] & 0x0F
         out.append((hi << 4) | lo)
@@ -216,8 +249,10 @@ def encode_gate(gate_index: int) -> int:
 
 
 def decode_gate(stored: int) -> int:
-    """Returns gate table index (0=LATCH, 1-253=seconds, 254=No OFF)."""
-    return _swap_nibbles(stored)
+    """Returns gate table index (0=LATCH, 1-253=seconds, 254=No OFF).
+    Clamps to 254 so that 0xFF padding in short blocks maps to No OFF
+    rather than crashing setCurrentIndex or encode_gate's range check."""
+    return min(_swap_nibbles(stored), GATE_NO_OFF)
 
 
 def gate_label(gate_index: int) -> str:
@@ -253,9 +288,14 @@ class SysExHeader:
 
 
 def parse_sysex_header(raw: bytes) -> SysExHeader:
-    assert raw[0] == 0xF0, 'Not a SysEx message'
-    assert raw[1:4] == bytes(KAT_MANUFACTURER), f'Unknown manufacturer: {raw[1:4].hex()}'
-    assert raw[4] == DRUMKAT_INSTRUMENT_ID, f'Unknown instrument: 0x{raw[4]:02X}'
+    if len(raw) < 9:
+        raise ValueError(f'SysEx file too short ({len(raw)} bytes)')
+    if raw[0] != 0xF0:
+        raise ValueError('Not a SysEx message (missing 0xF0)')
+    if raw[1:4] != bytes(KAT_MANUFACTURER):
+        raise ValueError(f'Unknown manufacturer: {raw[1:4].hex()}')
+    if raw[4] != DRUMKAT_INSTRUMENT_ID:
+        raise ValueError(f'Unknown instrument ID: 0x{raw[4]:02X}')
     return SysExHeader(
         dump_type     = raw[5],
         instrument_id = raw[6],
@@ -269,11 +309,12 @@ def parse_sysex_header(raw: bytes) -> SysExHeader:
 # ---------------------------------------------------------------------------
 
 class Surface:
-    def __init__(self, index: int, name: str, raw_block: list[int], kit_header: list[int]):
+    def __init__(self, index: int, name: str, raw_block: list[int], kit_header: list[int], ports: list[int]):
         self.index = index
         self.name  = name
-        self._block = list(raw_block)       # 25 raw internal bytes
+        self._block = list(raw_block)       # 24 data bytes
         self._kit_header = kit_header       # shared reference to Kit._header_bytes
+        self._ports = ports                 # shared reference to Kit._ports
 
     @property
     def mode(self) -> int:
@@ -330,6 +371,19 @@ class Surface:
     def link_name(self) -> str | None:
         idx = self.link
         return SURFACES[idx] if idx is not None else None
+
+    @property
+    def midi_port(self) -> int:
+        """0-based index into MIDI_PORT_NAMES. Only meaningful when mode is in MODES_WITH_PORT."""
+        return decode_midi_port(self._ports[self.index])
+
+    @midi_port.setter
+    def midi_port(self, idx: int):
+        self._ports[self.index] = encode_midi_port(idx)
+
+    @property
+    def midi_port_name(self) -> str:
+        return MIDI_PORT_NAMES[self.midi_port]
 
     @property
     def control_type(self) -> int:
@@ -462,6 +516,8 @@ class Surface:
                      f' note6={self.note6}({note_name(self.note6)})'
                      f' note7={self.note7}({note_name(self.note7)})'
                      f' note8={self.note8}({note_name(self.note8)})')
+        if self.mode in MODES_WITH_PORT:
+            base += f' port={self.midi_port_name}'
         if self.mode == 16:  # Control
             base += f' control_type={self.control_type_name}'
         if self.link is not None:
@@ -477,14 +533,16 @@ class Kit:
     def __init__(self, header: SysExHeader, internal: list[int]):
         self.sysex_header = header
         self._internal_size = len(internal)     # preserve original byte count
-        self._header_bytes = list(internal[:HEADER_SIZE])
+        self._header_bytes = list(internal[:HEADER_SIZE])   # bytes 0-116
+        # Port byte for surface[n] at internal offset 117 + n*25
+        self._ports = [internal[117 + i * 25] for i in range(NUM_SURFACES)]
         self.surfaces: list[Surface] = []
         for i, name in enumerate(SURFACES):
-            start = HEADER_SIZE + i * BLOCK_SIZE
-            block = internal[start:start + BLOCK_SIZE]
+            start = 118 + i * 25          # data bytes start after port byte
+            block = internal[start:start + BLOCK_SIZE]   # 24 data bytes
             if len(block) < BLOCK_SIZE:
                 block += [0xFF] * (BLOCK_SIZE - len(block))
-            self.surfaces.append(Surface(i, name, block, self._header_bytes))
+            self.surfaces.append(Surface(i, name, block, self._header_bytes, self._ports))
 
     def pad(self, n: int) -> Surface:
         """1-based pad access: pad(1) .. pad(10)."""
@@ -497,10 +555,11 @@ class Kit:
         return self.surfaces[9 + n]
 
     def to_internal(self) -> list[int]:
-        data = list(self._header_bytes)
-        for s in self.surfaces:
-            data.extend(s.raw())
-        return data[:self._internal_size]   # preserve original length
+        data = list(self._header_bytes)     # 117 bytes (0-116)
+        for i, s in enumerate(self.surfaces):
+            data.append(self._ports[i])     # port byte at 117 + i*25
+            data.extend(s.raw())            # 24 data bytes at 118 + i*25
+        return data[:self._internal_size]
 
     def to_sysex(self) -> bytes:
         internal = self.to_internal()
@@ -527,6 +586,23 @@ class Kit:
         for i, ch in enumerate(padded):
             self._header_bytes[NAME_OFFSET + i] = _swap_nibbles(ord(ch))
 
+    @property
+    def tempo(self) -> float:
+        """Kit tempo in BPM.  Formula: BPM = 10000 / nibble_swap(h[66]).
+        Returns a float rounded to 1 decimal place (e.g. 94.3, 109.9, 120.5)."""
+        stored = _swap_nibbles(self._header_bytes[TEMPO_OFFSET])
+        if stored == 0:
+            return TEMPO_MIN
+        return round(10000 / stored, 1)
+
+    @tempo.setter
+    def tempo(self, bpm: float):
+        """Set tempo in BPM.  Clamps to [TEMPO_MIN, TEMPO_MAX]."""
+        bpm = max(TEMPO_MIN, min(TEMPO_MAX, float(bpm)))
+        stored = round(10000 / bpm)
+        stored = max(1, min(255, stored))
+        self._header_bytes[TEMPO_OFFSET] = _swap_nibbles(stored)
+
     def __repr__(self):
         lines = [f'Kit "{self.name}" (sw=0x{self.sysex_header.sw_version:02X})']
         for s in self.surfaces:
@@ -541,7 +617,8 @@ class Kit:
 def load_kit(path: str) -> Kit:
     with open(path, 'rb') as f:
         raw = f.read()
-    assert raw[0] == 0xF0 and raw[-1] == 0xF7, 'Invalid SysEx file'
+    if not raw or raw[0] != 0xF0 or raw[-1] != 0xF7:
+        raise ValueError('Invalid SysEx file (missing F0…F7 framing)')
     header  = parse_sysex_header(raw)
     payload = raw[9:-1]
     internal = _decode_nibbles(payload)
@@ -551,6 +628,81 @@ def load_kit(path: str) -> Kit:
 def save_kit(kit: Kit, path: str):
     with open(path, 'wb') as f:
         f.write(kit.to_sysex())
+
+
+# ---------------------------------------------------------------------------
+# Kit bank (All Kits dump — 30 kits)
+# ---------------------------------------------------------------------------
+
+KIT_SIZE = 592   # internal bytes per kit (= 1184 nibble bytes)
+
+class KitBank:
+    """Holds all 30 kits from an All Kits SysEx dump."""
+
+    def __init__(self, header: SysExHeader, internal: list[int]):
+        self.sysex_header = header
+        expected = NUM_KITS * KIT_SIZE
+        if len(internal) != expected:
+            raise ValueError(
+                f'All Kits dump size mismatch: expected {expected} bytes, '
+                f'got {len(internal)}')
+        self.kits: list[Kit] = []
+        for i in range(NUM_KITS):
+            block = internal[i * KIT_SIZE:(i + 1) * KIT_SIZE]
+            # Build a minimal SysExHeader for each kit slot
+            slot_header = SysExHeader(DUMP_TYPE_KIT, header.instrument_id,
+                                      header.sw_version, i)
+            self.kits.append(Kit(slot_header, block))
+
+    def kit(self, n: int) -> Kit:
+        """1-based kit access: kit(1) .. kit(30)."""
+        assert 1 <= n <= NUM_KITS
+        return self.kits[n - 1]
+
+    def to_internal(self) -> list[int]:
+        data = []
+        for k in self.kits:
+            data.extend(k.to_internal())
+        return data
+
+    def to_sysex(self) -> bytes:
+        internal = self.to_internal()
+        h = self.sysex_header
+        header = bytes([
+            0xF0,
+            *KAT_MANUFACTURER,
+            DRUMKAT_INSTRUMENT_ID,
+            h.dump_type,
+            h.instrument_id,
+            h.sw_version,
+            h.aux,
+        ])
+        return header + _encode_nibbles(internal) + bytes([0xF7])
+
+    def __repr__(self):
+        lines = ['KitBank (30 kits):']
+        for i, k in enumerate(self.kits):
+            lines.append(f'  [{i+1:2d}] {k.name}')
+        return '\n'.join(lines)
+
+
+def load_kit_bank(path: str) -> KitBank:
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if not raw or raw[0] != 0xF0 or raw[-1] != 0xF7:
+        raise ValueError('Invalid SysEx file (missing F0…F7 framing)')
+    header = parse_sysex_header(raw)
+    if header.dump_type != DUMP_TYPE_ALL_KITS:
+        raise ValueError(
+            f'Expected All Kits dump (0x{DUMP_TYPE_ALL_KITS:02X}), '
+            f'got 0x{header.dump_type:02X}')
+    internal = _decode_nibbles(raw[9:-1])
+    return KitBank(header, internal)
+
+
+def save_kit_bank(bank: KitBank, path: str):
+    with open(path, 'wb') as f:
+        f.write(bank.to_sysex())
 
 
 # ---------------------------------------------------------------------------
