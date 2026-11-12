@@ -1,258 +1,150 @@
 """
 drumKAT 3.8 SysEx parser / builder.
 
-Confirmed byte map (from live diffing, May 2026):
-  Header: 9 SysEx bytes + 118 internal bytes (kit-level data)
-    header[12..30]: mode byte for each of the 19 surfaces (stride=1)
-      surface 0 (Pad 1) = header[12], surface 1 (Pad 2) = header[13], ...
-      mode encoding: nibble-swapped index  (0x00=Simple, 0x10=Multiple, ...)
-    header[31..49]: link target per surface; nibble-swap encoded surface index; 0xFF = no link
+Byte map, worked out by diffing live dumps (confidence noted where it is not
+a direct single-parameter diff).
 
-  Surface blocks: 19 surfaces, each occupying 25 bytes:
-    port byte at internal offset 117 + n*25 (Both=0xFF, None=0xCF, Right=0xDF, Left=0xEF)
-    24 data bytes at internal offset 118 + n*25:
-    Surfaces: Pad 1-10 (index 0-9), Trigger 1-9 (index 10-18)
-    +0  MIDI channel   stored = channel - 1  (0=ch1, 9=ch10, ...)
-    +1  MIDI note      nibble-swapped: stored = ((note&0xF)<<4)|(note>>4)
-    +2  Velocity       stored = vel*2 + 15;  range 0-120
-    +3..+22  partially mapped:
-      +7, +9, +19  additional note slots for Multiple mode (notes 2, 3, 4)
-    +23  0x30  block terminator
+SysEx framing
+  F0 00 00 15 68 TT II VV AX <nibble pairs> F7
+    TT dump type (10h = one kit, 12h = all 30 kits), II instrument ID,
+    VV software version, AX aux (kit number).
+  Every internal byte is sent as two bytes: high nibble, then low nibble.
+  Most values are additionally stored nibble-swapped ("swapped" below).
 
-SysEx header (9 bytes):
-  F0 00 00 15 68 TT II VV AX
-    TT = dump type  (10h = single kit)
-    II = instrument ID
-    VV = software version
-    AX = aux (kit number, etc.)
+Kit = 592 internal bytes = 117-byte header + 19 surfaces x 25 bytes.
+
+Header
+  0-11    kit name, swapped ASCII, space padded
+  12-30   mode per surface, swapped index into MODE_NAMES
+  31-49   link target per surface, swapped surface index, FF = none
+  54-65   six program-change slots, 2 bytes each: channel-1 in the low nibble,
+          then swapped program number (128 = not sent).       [inferred: the
+          factory defaults and the per-kit values line up with Kit Edit
+          screens 11/12; where the slot's side and volume live is unknown]
+  66      tempo, swapped; BPM = 10000 / value (40..255 -> 250..39.2 BPM)
+  86-88   Foot-Chick channel (low nibble) / swapped note / velocity [inferred]
+  rest    unmapped (kept verbatim)
+
+Surface (Pad 1-10, Trigger 1-9): 1 side byte + 24 data bytes
+  side byte  two bits per sound: 00 None, 01 Right, 10 Left, 11 Both.
+             Sound 1 = bits 5:4 (confirmed); sounds 2/3/4 = bits 7:6, 1:0,
+             3:2 [inferred from kits that switch unused sounds off].
+  data       four 6-byte sounds (confirmed by the "37 74 65 63" Multiple dump):
+    +0  (curve-1) << 4 | (channel-1)
+    +1  note, swapped; 128 = OFF
+    +2  velocity: (min // 8) << 4 | (max - 7) // 8
+    +3  gate time, swapped index into GATE_TABLE
+    +4  swapped, meaning depends on mode:
+          Velocity Shift  low end of the sound's dynamic range   [inferred]
+          Note Shift      top note of the range                  [inferred]
+          Gate Shift      longest gate (GATE_TABLE index)        [inferred]
+          Multiple        probably the delay time                [unverified]
+    +5  swapped: Velocity Shift = high end of the dynamic range  [inferred];
+        Control mode (sound 1 only) = control type.
+
+  Simple, Note Shift, Gate Shift, FC Gate and Control use sound 1 only.
+  The 8-note modes (Hat Note, Alternate 8, Random 8, Melodic Random) keep
+  sound 1's bytes +0..+3 and store notes 2-8 as (channel, note) pairs at
+  +4/+5, +6/+7 ... +16/+17: channel-1 in the low nibble, swapped note. They
+  share sound 1's velocity, curve, gate and side.
 """
 
+from dataclasses import dataclass
+
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+NOTE_OFF = 128          # note value meaning "this slot is off"
 
-# Gate time lookup table — index 0=LATCH, 254=No OFF, 1-253=seconds
-# Stored byte = nibble_swap(index)
-def _build_gate_table() -> list:
-    t = [None]  # index 0 = LATCH
-    v = 0.010
-    while round(v, 3) <= 0.400:
-        t.append(round(v, 3)); v += 0.005
-    v = 0.425
-    while round(v, 3) <= 4.225:
-        t.append(round(v, 3)); v += 0.025
-    v = 4.300
-    while round(v, 3) <= 6.300:
-        t.append(round(v, 3)); v += 0.100
-    t.append(None)  # index 254 = No OFF
-    return t
-
-GATE_TABLE = _build_gate_table()
-GATE_LATCH  = 0      # index
-GATE_NO_OFF = 254    # index
-
-SURFACES = (
-    [f'Pad {i+1}' for i in range(10)]
-    + [f'Trigger {i+1}' for i in range(9)]
-)
-
-# Mode names indexed 0-16 (hardware displays 1-17)
-CONTROL_TYPE_NAMES = [
-    'Home Base',              # 0
-    'Alt Reset',              # 1
-    'Motif Resync',           # 2
-    'Kit Advance',            # 3
-    'Kit Reverse',            # 4
-    'Note Freeze Alt',        # 5
-    'Group Step Transpose',   # 6
-    'Group Step Trans R',     # 7
-    'Auto Pad Transpose',     # 8
-    'AutoPadTrans and Home',  # 9
-    'Program Change',         # 10
-    'Kit Change',             # 11
-    'Tempo Change',           # 12
-    'Tap Tempo',              # 13
-    'Motif',                  # 14
-    'Ext Midi Clock',         # 15
-    'Pressure',               # 16
-    'Ready Record',           # 17
-]
-
-MODE_NAMES = [
-    'Simple',               # 0
-    'Multiple',             # 1
-    'Alternate',            # 2
-    'Note Shift',           # 3
-    'Gate Shift',           # 4
-    'Velocity Shift',       # 5
-    'Hat Open',             # 6
-    'FC Gate',              # 7
-    'Hat Note',             # 8
-    'Alternate 8',          # 9
-    'Random 8',             # 10
-    'Melodic Multiple',     # 11
-    'Melodic Alternate',    # 12
-    'Melodic Random',       # 13
-    'Melodic Note Shift',   # 14
-    'Melodic Velocity Shift', # 15
-    'Control',              # 16
-]
-
-KAT_MANUFACTURER = (0x00, 0x00, 0x15)
-DRUMKAT_INSTRUMENT_ID = 0x68
-DUMP_TYPE_KIT      = 0x10
-DUMP_TYPE_ALL_KITS = 0x12
+SURFACES = [f'Pad {i}' for i in range(1, 11)] + [f'Trigger {i}' for i in range(1, 10)]
+NUM_SURFACES = len(SURFACES)
 NUM_KITS = 30
 
-HEADER_SIZE = 117       # internal bytes of true kit header (bytes 0-116)
-BLOCK_SIZE = 24         # internal data bytes per surface (excludes port byte)
-# Each surface occupies 25 bytes total: 1 port byte + 24 data bytes
-# Port byte for surface[n] is at internal offset 117 + n*25
-NUM_SURFACES = 19
+MODE_NAMES = [
+    'Simple', 'Multiple', 'Alternate', 'Note Shift', 'Gate Shift',
+    'Velocity Shift', 'Hat Open', 'FC Gate', 'Hat Note', 'Alternate 8',
+    'Random 8', 'Melodic Multiple', 'Melodic Alternate', 'Melodic Random',
+    'Melodic Note Shift', 'Melodic Velocity Shift', 'Control',
+]
+MODE_NOTE_SHIFT, MODE_GATE_SHIFT, MODE_VELOCITY_SHIFT, MODE_CONTROL = 3, 4, 5, 16
+MODES_4_SOUNDS = {1, 2, 5, 6, 11, 12, 14, 15}   # four independent sounds
+MODES_8_NOTES = {8, 9, 10, 13}                  # one sound + seven extra notes
+MODES_WITH_PORT = set(range(1, 16))             # everything but Simple and Control
 
-NAME_OFFSET = 0         # header bytes 0-11: kit name, nibble-swapped ASCII, space-padded
+# Indexed by the value the hardware stores (Home Base = 5 and Alt Reset = 6
+# are confirmed by dumps; the rest follows the order the unit cycles through).
+CONTROL_TYPE_NAMES = [
+    'Tap Tempo', 'Motif', 'Ext Midi Clock', 'Pressure', 'Ready Record',
+    'Home Base', 'Alt Reset', 'Motif Resync', 'Kit Advance', 'Kit Reverse',
+    'Note Freeze Alt', 'Group Step Transpose', 'Group Step Trans R',
+    'Auto Pad Transpose', 'AutoPadTrans and Home', 'Program Change',
+    'Kit Change', 'Tempo Change',
+]
+
+MIDI_PORT_NAMES = ['None', 'Right', 'Left', 'Both']   # index = stored 2-bit value
+_PORT_SHIFTS = (4, 6, 0, 2)                           # bit position per sound
+
+# Gate times: index 0 = Latch, 1-253 = seconds, 254 = No OFF.
+GATE_LATCH, GATE_NO_OFF = 0, 254
+GATE_TABLE = ([None]
+              + [ms / 1000 for ms in range(10, 401, 5)]
+              + [ms / 1000 for ms in range(425, 4226, 25)]
+              + [ms / 1000 for ms in range(4300, 6301, 100)]
+              + [None])
+
+KAT_MANUFACTURER = bytes((0x00, 0x00, 0x15))
+DRUMKAT_INSTRUMENT_ID = 0x68
+DUMP_TYPE_KIT = 0x10
+DUMP_TYPE_ALL_KITS = 0x12
+SYSEX_HEADER_SIZE = 9
+
+HEADER_SIZE = 117
+SURFACE_SIZE = 25       # side byte + 24 data bytes
+SOUND_SIZE = 6
+KIT_SIZE = HEADER_SIZE + NUM_SURFACES * SURFACE_SIZE    # 592
+
 NAME_LENGTH = 12
-MODE_BASE_OFFSET = 12   # header bytes 12-30: mode byte per surface, nibble-swap encoded
-LINK_BASE_OFFSET = 31   # header bytes 31-49: link target per surface, nibble-swap encoded surface index; 0xFF = no link
-TEMPO_OFFSET = 66       # header byte 66: tempo, stored as nibble_swap(round(10000/BPM))
-TEMPO_MIN = 30.0        # minimum displayable BPM
-TEMPO_MAX = 250.0       # maximum displayable BPM
-
-# Offsets within each 25-byte block
-OFF_CHANNEL      = 0
-OFF_NOTE         = 1    # note 1
-OFF_VELOCITY     = 2
-OFF_GATE         = 3
-OFF_NOTE2        = 5    # note 2  (stride-2 from +5; confirmed Alternate 8 dump)
-OFF_NOTE3        = 7    # note 3
-OFF_NOTE4        = 9    # note 4
-OFF_NOTE5        = 11   # note 5
-OFF_NOTE6        = 13   # note 6
-OFF_NOTE7        = 15   # note 7
-OFF_NOTE8        = 17   # note 8
-# Control mode repurposes block+5 for control type (overlaps with OFF_NOTE2)
-OFF_CONTROL_TYPE = 5    # stored = nibble_swap(control_type_index + CONTROL_TYPE_OFFSET)
-CONTROL_TYPE_OFFSET = 5 # hardware internal index of CONTROL_TYPE_NAMES[0]
-
-MIDI_PORT_NAMES  = ['Both', 'None', 'Right', 'Left']
-MIDI_PORT_VALUES = [0xFF, 0xCF, 0xDF, 0xEF]  # confirmed from live dumps
-# Only available in modes other than Simple (0) and Control (16)
-MODES_WITH_PORT = set(range(1, 16))  # modes 1-15
-
-
-def encode_midi_port(idx: int) -> int:
-    """idx is 0-based index into MIDI_PORT_NAMES."""
-    assert 0 <= idx < len(MIDI_PORT_NAMES)
-    return MIDI_PORT_VALUES[idx]
-
-
-def decode_midi_port(stored: int) -> int:
-    """Returns 0-based index into MIDI_PORT_NAMES, or 0 (Both) if unrecognised."""
-    try:
-        return MIDI_PORT_VALUES.index(stored)
-    except ValueError:
-        return 0
+MODE_BASE_OFFSET = 12
+LINK_BASE_OFFSET = 31
+PROGRAM_BASE_OFFSET = 54
+NUM_PROGRAM_SLOTS = 6
+TEMPO_OFFSET = 66
+TEMPO_SCALE = 10000
+TEMPO_STORED_MIN, TEMPO_STORED_MAX = 40, 255            # 250 .. 39.2 BPM
+TEMPO_MIN = round(TEMPO_SCALE / TEMPO_STORED_MAX, 1)
+TEMPO_MAX = TEMPO_SCALE / TEMPO_STORED_MIN
 
 
 # ---------------------------------------------------------------------------
 # Encoding helpers
 # ---------------------------------------------------------------------------
 
+def swap_nibbles(b: int) -> int:
+    return ((b & 0x0F) << 4) | (b >> 4)
+
+
+def _check(value: int, lo: int, hi: int, what: str) -> int:
+    if not lo <= value <= hi:
+        raise ValueError(f'{what} must be {lo}-{hi}, got {value}')
+    return value
+
+
 def _decode_nibbles(payload: bytes) -> list[int]:
-    """Convert nibble-encoded SysEx payload to internal bytes.
-    Each internal byte is stored as two SysEx bytes (high nibble, low nibble).
-    Raises ValueError if payload length is odd (malformed SysEx)."""
-    if len(payload) % 2 != 0:
-        raise ValueError(
-            f'SysEx payload length is odd ({len(payload)}); '
-            'expected even-length nibble pairs')
-    out = []
-    for i in range(0, len(payload), 2):
-        hi = payload[i] & 0x0F
-        lo = payload[i + 1] & 0x0F
-        out.append((hi << 4) | lo)
-    return out
+    if len(payload) % 2:
+        raise ValueError(f'SysEx payload has an odd length ({len(payload)})')
+    return [((payload[i] & 0x0F) << 4) | (payload[i + 1] & 0x0F)
+            for i in range(0, len(payload), 2)]
 
 
 def _encode_nibbles(data: list[int]) -> bytes:
-    """Convert internal bytes to nibble-encoded SysEx payload."""
-    out = []
-    for b in data:
-        out.append((b >> 4) & 0x0F)
-        out.append(b & 0x0F)
-    return bytes(out)
+    return bytes(n for b in data for n in (b >> 4, b & 0x0F))
 
 
-def _swap_nibbles(b: int) -> int:
-    return ((b & 0x0F) << 4) | ((b >> 4) & 0x0F)
+def tempo_from_stored(stored: int) -> float:
+    stored = min(max(stored, TEMPO_STORED_MIN), TEMPO_STORED_MAX)
+    return round(TEMPO_SCALE / stored, 1)
 
 
-def encode_note(midi_note: int) -> int:
-    assert 0 <= midi_note <= 127
-    return _swap_nibbles(midi_note)
-
-
-def decode_note(stored: int) -> int:
-    return _swap_nibbles(stored)
-
-
-def encode_channel_curve(channel: int, curve: int) -> int:
-    """channel is 1-16, curve is 1-16.
-    Stored as ((curve-1) << 4) | (channel-1)."""
-    assert 1 <= channel <= 16
-    assert 1 <= curve <= 16
-    return ((curve - 1) << 4) | (channel - 1)
-
-
-def decode_channel_curve(stored: int) -> tuple[int, int]:
-    """Returns (channel, curve): both 1-16."""
-    return (stored & 0x0F) + 1, (stored >> 4) + 1
-
-
-def encode_velocity(vel_min: int, vel_max: int) -> int:
-    """Pack velMin (0,8,16..120) and velMax (7,15,23..127) into one byte.
-    Upper nibble = velMin // 8; lower nibble = (velMax - 7) // 8."""
-    assert 0 <= vel_min <= 120 and vel_min % 8 == 0
-    assert 7 <= vel_max <= 127 and (vel_max - 7) % 8 == 0
-    return ((vel_min // 8) << 4) | ((vel_max - 7) // 8)
-
-
-def decode_velocity(stored: int) -> tuple[int, int]:
-    """Returns (velMin, velMax): velMin in steps of 8 (0-120),
-    velMax in steps of 8 offset by 7 (7-127)."""
-    return (stored >> 4) * 8, (stored & 0x0F) * 8 + 7
-
-
-def encode_mode(mode_index: int) -> int:
-    """mode_index is 0-16; stored as nibble-swapped index."""
-    assert 0 <= mode_index <= 16
-    return _swap_nibbles(mode_index)
-
-
-def decode_mode(stored: int) -> int:
-    return _swap_nibbles(stored)
-
-
-def encode_control_type(idx: int) -> int:
-    """idx is 0-based index into CONTROL_TYPE_NAMES."""
-    assert 0 <= idx < len(CONTROL_TYPE_NAMES)
-    return _swap_nibbles(idx + CONTROL_TYPE_OFFSET)
-
-
-def decode_control_type(stored: int) -> int:
-    """Returns 0-based index into CONTROL_TYPE_NAMES."""
-    return _swap_nibbles(stored) - CONTROL_TYPE_OFFSET
-
-
-def encode_gate(gate_index: int) -> int:
-    """gate_index: 0=LATCH, 1-253=seconds (see GATE_TABLE), 254=No OFF."""
-    assert 0 <= gate_index <= 254
-    return _swap_nibbles(gate_index)
-
-
-def decode_gate(stored: int) -> int:
-    """Returns gate table index (0=LATCH, 1-253=seconds, 254=No OFF).
-    Clamps to 254 so that 0xFF padding in short blocks maps to No OFF
-    rather than crashing setCurrentIndex or encode_gate's range check."""
-    return min(_swap_nibbles(stored), GATE_NO_OFF)
+def tempo_to_stored(bpm: float) -> int:
+    return min(max(round(TEMPO_SCALE / max(bpm, 1)), TEMPO_STORED_MIN), TEMPO_STORED_MAX)
 
 
 def gate_label(gate_index: int) -> str:
@@ -260,471 +152,359 @@ def gate_label(gate_index: int) -> str:
         return 'Latch'
     if gate_index == GATE_NO_OFF:
         return 'No OFF'
-    v = GATE_TABLE[gate_index]
-    return f'{v:.3f}s' if v is not None else f'?({gate_index})'
+    return f'{GATE_TABLE[gate_index]:.3f}s'
 
 
 def note_name(midi_note: int) -> str:
+    if midi_note == NOTE_OFF:
+        return 'OFF'
     if not 0 <= midi_note <= 127:
         return '???'
-    return f'{NOTE_NAMES[midi_note % 12]}{(midi_note // 12) - 1}'
+    return f'{NOTE_NAMES[midi_note % 12]}{midi_note // 12 - 1}'
+
+
+def _swapped(offset: int, lo: int, hi: int, what: str, doc: str) -> property:
+    """Property for a nibble-swapped byte at `offset` from the owner's base."""
+    def get(self):
+        return min(swap_nibbles(self._block[self._base + offset]), hi)
+
+    def put(self, value):
+        self._block[self._base + offset] = swap_nibbles(_check(value, lo, hi, what))
+
+    return property(get, put, doc=doc)
 
 
 # ---------------------------------------------------------------------------
-# SysEx header
+# Sounds and surfaces
 # ---------------------------------------------------------------------------
 
-class SysExHeader:
-    def __init__(self, dump_type, instrument_id, sw_version, aux):
-        self.dump_type     = dump_type
-        self.instrument_id = instrument_id
-        self.sw_version    = sw_version
-        self.aux           = aux
+class NoteSlot:
+    """A (channel, note) pair inside a surface block."""
 
-    def __repr__(self):
-        return (f'SysExHeader(dump_type=0x{self.dump_type:02X}, '
-                f'instrument_id=0x{self.instrument_id:02X}, '
-                f'sw_version=0x{self.sw_version:02X}, aux=0x{self.aux:02X})')
-
-
-def parse_sysex_header(raw: bytes) -> SysExHeader:
-    if len(raw) < 9:
-        raise ValueError(f'SysEx file too short ({len(raw)} bytes)')
-    if raw[0] != 0xF0:
-        raise ValueError('Not a SysEx message (missing 0xF0)')
-    if raw[1:4] != bytes(KAT_MANUFACTURER):
-        raise ValueError(f'Unknown manufacturer: {raw[1:4].hex()}')
-    if raw[4] != DRUMKAT_INSTRUMENT_ID:
-        raise ValueError(f'Unknown instrument ID: 0x{raw[4]:02X}')
-    return SysExHeader(
-        dump_type     = raw[5],
-        instrument_id = raw[6],
-        sw_version    = raw[7],
-        aux           = raw[8],
-    )
-
-
-# ---------------------------------------------------------------------------
-# Pad / trigger surface
-# ---------------------------------------------------------------------------
-
-class Surface:
-    def __init__(self, index: int, name: str, raw_block: list[int], kit_header: list[int], ports: list[int]):
-        self.index = index
-        self.name  = name
-        self._block = list(raw_block)       # 24 data bytes
-        self._kit_header = kit_header       # shared reference to Kit._header_bytes
-        self._ports = ports                 # shared reference to Kit._ports
-
-    @property
-    def mode(self) -> int:
-        return decode_mode(self._kit_header[MODE_BASE_OFFSET + self.index])
-
-    @mode.setter
-    def mode(self, value: int):
-        self._kit_header[MODE_BASE_OFFSET + self.index] = encode_mode(value)
-
-    @property
-    def mode_name(self) -> str:
-        m = self.mode
-        return MODE_NAMES[m] if m < len(MODE_NAMES) else f'Mode{m}'
+    def __init__(self, block: list[int], channel_offset: int, note_offset: int):
+        self._block = block
+        self._base = 0
+        self._ch = channel_offset
+        self._note = note_offset
 
     @property
     def channel(self) -> int:
         """MIDI channel 1-16."""
-        return decode_channel_curve(self._block[OFF_CHANNEL])[0]
+        return (self._block[self._ch] & 0x0F) + 1
 
     @channel.setter
     def channel(self, value: int):
-        _, crv = decode_channel_curve(self._block[OFF_CHANNEL])
-        self._block[OFF_CHANNEL] = encode_channel_curve(value, crv)
+        self._block[self._ch] = (self._block[self._ch] & 0xF0) | (_check(value, 1, 16, 'channel') - 1)
+
+    @property
+    def note(self) -> int:
+        """MIDI note 0-127, or NOTE_OFF."""
+        return min(swap_nibbles(self._block[self._note]), NOTE_OFF)
+
+    @note.setter
+    def note(self, value: int):
+        self._block[self._note] = swap_nibbles(_check(value, 0, NOTE_OFF, 'note'))
+
+
+class Sound(NoteSlot):
+    """One of the four 6-byte sounds of a surface."""
+
+    def __init__(self, block: list[int], ports: list[int], surface_index: int, index: int):
+        base = index * SOUND_SIZE
+        super().__init__(block, base, base + 1)
+        self._base = base
+        self._ports = ports
+        self._surface_index = surface_index
+        self._port_shift = _PORT_SHIFTS[index]
 
     @property
     def curve(self) -> int:
         """Velocity curve 1-16."""
-        return decode_channel_curve(self._block[OFF_CHANNEL])[1]
+        return (self._block[self._base] >> 4) + 1
 
     @curve.setter
     def curve(self, value: int):
-        ch, _ = decode_channel_curve(self._block[OFF_CHANNEL])
-        self._block[OFF_CHANNEL] = encode_channel_curve(ch, value)
+        self._block[self._base] = ((_check(value, 1, 16, 'curve') - 1) << 4) | (self._block[self._base] & 0x0F)
+
+    @property
+    def vel_min(self) -> int:
+        """Minimum velocity: 0, 8, 16 ... 120."""
+        return (self._block[self._base + 2] >> 4) * 8
+
+    @vel_min.setter
+    def vel_min(self, value: int):
+        self._block[self._base + 2] = ((_check(value, 0, 120, 'vel_min') // 8) << 4) | (self._block[self._base + 2] & 0x0F)
+
+    @property
+    def vel_max(self) -> int:
+        """Maximum velocity: 7, 15, 23 ... 127."""
+        return (self._block[self._base + 2] & 0x0F) * 8 + 7
+
+    @vel_max.setter
+    def vel_max(self, value: int):
+        self._block[self._base + 2] = (self._block[self._base + 2] & 0xF0) | ((_check(value, 7, 127, 'vel_max') - 7) // 8)
+
+    gate = _swapped(3, 0, GATE_NO_OFF, 'gate', 'GATE_TABLE index (0 = Latch, 254 = No OFF).')
+    dyn_min = _swapped(4, 0, 127, 'dyn_min', 'Velocity Shift: softest hit that plays this sound.')
+    dyn_max = _swapped(5, 0, 127, 'dyn_max', 'Velocity Shift: hardest hit that plays this sound.')
+
+    @property
+    def port(self) -> int:
+        """Index into MIDI_PORT_NAMES. Ignored by the unit in Simple and Control modes."""
+        return (self._ports[self._surface_index] >> self._port_shift) & 3
+
+    @port.setter
+    def port(self, value: int):
+        cleared = self._ports[self._surface_index] & ~(3 << self._port_shift)
+        self._ports[self._surface_index] = cleared | (_check(value, 0, 3, 'port') << self._port_shift)
+
+    def describe(self) -> str:
+        return (f'ch={self.channel} note={self.note}({note_name(self.note)}) '
+                f'vel={self.vel_min}-{self.vel_max} curve={self.curve} gate={gate_label(self.gate)}')
+
+
+class Surface:
+    """A pad or trigger. `sounds[0]` is the sound every mode uses."""
+
+    def __init__(self, index: int, block: list[int], kit_header: list[int], ports: list[int]):
+        self.index = index
+        self.name = SURFACES[index]
+        self._block = list(block)
+        self._base = 0
+        self._header = kit_header       # shared with the Kit
+        self.sounds = [Sound(self._block, ports, index, k) for k in range(4)]
+        self.notes8 = [self.sounds[0]] + [NoteSlot(self._block, 2 + 2 * n, 3 + 2 * n) for n in range(1, 8)]
+
+    @property
+    def mode(self) -> int:
+        return swap_nibbles(self._header[MODE_BASE_OFFSET + self.index])
+
+    @mode.setter
+    def mode(self, value: int):
+        self._header[MODE_BASE_OFFSET + self.index] = swap_nibbles(_check(value, 0, len(MODE_NAMES) - 1, 'mode'))
+
+    @property
+    def mode_name(self) -> str:
+        return MODE_NAMES[self.mode] if self.mode < len(MODE_NAMES) else f'Mode{self.mode}'
+
+    @property
+    def slots(self) -> list[NoteSlot]:
+        """The notes this surface's mode can play: 4 sounds, 8 notes, or 1 sound."""
+        if self.mode in MODES_4_SOUNDS:
+            return self.sounds
+        if self.mode in MODES_8_NOTES:
+            return self.notes8
+        return self.sounds[:1]
 
     @property
     def link(self) -> int | None:
-        """Linked surface index (0-based), or None if not linked."""
-        stored = self._kit_header[LINK_BASE_OFFSET + self.index]
-        if stored == 0xFF:
-            return None
-        idx = _swap_nibbles(stored)
+        """Linked surface index, or None."""
+        idx = swap_nibbles(self._header[LINK_BASE_OFFSET + self.index])
         return idx if idx < NUM_SURFACES else None
 
     @link.setter
     def link(self, value: int | None):
-        """Set linked surface index (0-18), or None to clear."""
-        if value is None:
-            self._kit_header[LINK_BASE_OFFSET + self.index] = 0xFF
-        else:
-            assert 0 <= value <= 18
-            self._kit_header[LINK_BASE_OFFSET + self.index] = _swap_nibbles(value)
+        self._header[LINK_BASE_OFFSET + self.index] = (
+            0xFF if value is None else swap_nibbles(_check(value, 0, NUM_SURFACES - 1, 'link')))
 
-    @property
-    def link_name(self) -> str | None:
-        idx = self.link
-        return SURFACES[idx] if idx is not None else None
-
-    @property
-    def midi_port(self) -> int:
-        """0-based index into MIDI_PORT_NAMES. Only meaningful when mode is in MODES_WITH_PORT."""
-        return decode_midi_port(self._ports[self.index])
-
-    @midi_port.setter
-    def midi_port(self, idx: int):
-        self._ports[self.index] = encode_midi_port(idx)
-
-    @property
-    def midi_port_name(self) -> str:
-        return MIDI_PORT_NAMES[self.midi_port]
-
-    @property
-    def control_type(self) -> int:
-        """0-based index into CONTROL_TYPE_NAMES. Only meaningful when mode == 16 (Control)."""
-        return decode_control_type(self._block[OFF_CONTROL_TYPE])
-
-    @control_type.setter
-    def control_type(self, idx: int):
-        self._block[OFF_CONTROL_TYPE] = encode_control_type(idx)
+    control_type = _swapped(5, 0, 255, 'control_type', 'Index into CONTROL_TYPE_NAMES (Control mode).')
+    shift_end = _swapped(4, 0, 255, 'shift_end',
+                         'Note Shift: top note. Gate Shift: longest gate (GATE_TABLE index).')
 
     @property
     def control_type_name(self) -> str:
-        idx = self.control_type
-        return CONTROL_TYPE_NAMES[idx] if 0 <= idx < len(CONTROL_TYPE_NAMES) else f'?({idx})'
-
-    @property
-    def note(self) -> int:
-        return decode_note(self._block[OFF_NOTE])
-
-    @note.setter
-    def note(self, value: int):
-        self._block[OFF_NOTE] = encode_note(value)
-
-    @property
-    def gate(self) -> int:
-        """Gate time table index (0=LATCH, 1-253=seconds, 254=No OFF)."""
-        return decode_gate(self._block[OFF_GATE])
-
-    @gate.setter
-    def gate(self, value: int):
-        self._block[OFF_GATE] = encode_gate(value)
-
-    @property
-    def gate_label(self) -> str:
-        return gate_label(self.gate)
-
-    @property
-    def vel_min(self) -> int:
-        return decode_velocity(self._block[OFF_VELOCITY])[0]
-
-    @vel_min.setter
-    def vel_min(self, value: int):
-        _, vmax = decode_velocity(self._block[OFF_VELOCITY])
-        self._block[OFF_VELOCITY] = encode_velocity(value, vmax)
-
-    @property
-    def vel_max(self) -> int:
-        return decode_velocity(self._block[OFF_VELOCITY])[1]
-
-    @vel_max.setter
-    def vel_max(self, value: int):
-        vmin, _ = decode_velocity(self._block[OFF_VELOCITY])
-        self._block[OFF_VELOCITY] = encode_velocity(vmin, value)
-
-    @property
-    def note2(self) -> int:
-        return decode_note(self._block[OFF_NOTE2])
-
-    @note2.setter
-    def note2(self, value: int):
-        self._block[OFF_NOTE2] = encode_note(value)
-
-    @property
-    def note3(self) -> int:
-        return decode_note(self._block[OFF_NOTE3])
-
-    @note3.setter
-    def note3(self, value: int):
-        self._block[OFF_NOTE3] = encode_note(value)
-
-    @property
-    def note4(self) -> int:
-        return decode_note(self._block[OFF_NOTE4])
-
-    @note4.setter
-    def note4(self, value: int):
-        self._block[OFF_NOTE4] = encode_note(value)
-
-    @property
-    def note5(self) -> int:
-        return decode_note(self._block[OFF_NOTE5])
-
-    @note5.setter
-    def note5(self, value: int):
-        self._block[OFF_NOTE5] = encode_note(value)
-
-    @property
-    def note6(self) -> int:
-        return decode_note(self._block[OFF_NOTE6])
-
-    @note6.setter
-    def note6(self, value: int):
-        self._block[OFF_NOTE6] = encode_note(value)
-
-    @property
-    def note7(self) -> int:
-        return decode_note(self._block[OFF_NOTE7])
-
-    @note7.setter
-    def note7(self, value: int):
-        self._block[OFF_NOTE7] = encode_note(value)
-
-    @property
-    def note8(self) -> int:
-        return decode_note(self._block[OFF_NOTE8])
-
-    @note8.setter
-    def note8(self, value: int):
-        self._block[OFF_NOTE8] = encode_note(value)
+        ct = self.control_type
+        return CONTROL_TYPE_NAMES[ct] if ct < len(CONTROL_TYPE_NAMES) else f'?({ct})'
 
     def raw(self) -> list[int]:
         return list(self._block)
 
     def __repr__(self):
-        base = (f'{self.name}: mode={self.mode_name} ch={self.channel} curve={self.curve} '
-                f'note={self.note}({note_name(self.note)}) '
-                f'velMin={self.vel_min} velMax={self.vel_max} gate={self.gate_label}')
-        MODES_4 = {1, 2, 5, 11, 12, 14, 15}
-        MODES_8 = {9, 10, 13}
-        m = self.mode
-        if m in MODES_4:
-            base += (f' note2={self.note2}({note_name(self.note2)})'
-                     f' note3={self.note3}({note_name(self.note3)})'
-                     f' note4={self.note4}({note_name(self.note4)})')
-        elif m in MODES_8:
-            base += (f' note2={self.note2}({note_name(self.note2)})'
-                     f' note3={self.note3}({note_name(self.note3)})'
-                     f' note4={self.note4}({note_name(self.note4)})'
-                     f' note5={self.note5}({note_name(self.note5)})'
-                     f' note6={self.note6}({note_name(self.note6)})'
-                     f' note7={self.note7}({note_name(self.note7)})'
-                     f' note8={self.note8}({note_name(self.note8)})')
-        if self.mode in MODES_WITH_PORT:
-            base += f' port={self.midi_port_name}'
-        if self.mode == 16:  # Control
-            base += f' control_type={self.control_type_name}'
+        mode = self.mode
+        parts = [f'{self.name}: {self.mode_name}']
+        if mode in MODES_8_NOTES:
+            parts.append(self.sounds[0].describe())
+            parts.append('notes=' + ','.join(f'{s.note}/ch{s.channel}' for s in self.notes8))
+        else:
+            parts += [f'[{s.describe()}]' for s in self.slots]
+        if mode in MODES_WITH_PORT:
+            parts.append('port=' + '/'.join(MIDI_PORT_NAMES[s.port] for s in self.slots if isinstance(s, Sound)))
+        if mode == MODE_CONTROL:
+            parts.append(f'control={self.control_type_name}')
         if self.link is not None:
-            base += f' link={self.link_name}'
-        return base
+            parts.append(f'link={SURFACES[self.link]}')
+        return ' '.join(parts)
+
+
+# Shortcuts so `surface.note`, `surface.channel` ... address sound 1.
+def _first_sound(attr: str) -> property:
+    return property(lambda self: getattr(self.sounds[0], attr),
+                    lambda self, value: setattr(self.sounds[0], attr, value))
+
+
+for _attr in ('channel', 'note', 'curve', 'vel_min', 'vel_max', 'gate', 'port'):
+    setattr(Surface, _attr, _first_sound(_attr))
 
 
 # ---------------------------------------------------------------------------
-# Kit
+# SysEx framing
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SysExHeader:
+    dump_type: int
+    instrument_id: int
+    sw_version: int
+    aux: int
+
+
+def parse_sysex(raw: bytes) -> tuple[SysExHeader, list[int]]:
+    """Validate a drumKAT SysEx message; return its header and internal bytes."""
+    if len(raw) < SYSEX_HEADER_SIZE + 1 or raw[0] != 0xF0 or raw[-1] != 0xF7:
+        raise ValueError('Not a SysEx file (missing F0 ... F7 framing)')
+    if raw[1:4] != KAT_MANUFACTURER:
+        raise ValueError(f'Not a KAT SysEx file (manufacturer {raw[1:4].hex()})')
+    if raw[4] != DRUMKAT_INSTRUMENT_ID:
+        raise ValueError(f'Not a drumKAT dump (instrument 0x{raw[4]:02X})')
+    return SysExHeader(*raw[5:9]), _decode_nibbles(raw[SYSEX_HEADER_SIZE:-1])
+
+
+def _build_sysex(h: SysExHeader, internal: list[int]) -> bytes:
+    head = bytes((0xF0, *KAT_MANUFACTURER, DRUMKAT_INSTRUMENT_ID,
+                  h.dump_type, h.instrument_id, h.sw_version, h.aux))
+    return head + _encode_nibbles(internal) + b'\xF7'
+
+
+# ---------------------------------------------------------------------------
+# Kit and kit bank
 # ---------------------------------------------------------------------------
 
 class Kit:
     def __init__(self, header: SysExHeader, internal: list[int]):
+        if len(internal) != KIT_SIZE:
+            raise ValueError(f'Kit data must be {KIT_SIZE} bytes, got {len(internal)}')
         self.sysex_header = header
-        self._internal_size = len(internal)     # preserve original byte count
-        self._header_bytes = list(internal[:HEADER_SIZE])   # bytes 0-116
-        # Port byte for surface[n] at internal offset 117 + n*25
-        self._ports = [internal[117 + i * 25] for i in range(NUM_SURFACES)]
-        self.surfaces: list[Surface] = []
-        for i, name in enumerate(SURFACES):
-            start = 118 + i * 25          # data bytes start after port byte
-            block = internal[start:start + BLOCK_SIZE]   # 24 data bytes
-            if len(block) < BLOCK_SIZE:
-                block += [0xFF] * (BLOCK_SIZE - len(block))
-            self.surfaces.append(Surface(i, name, block, self._header_bytes, self._ports))
+        self._header = list(internal[:HEADER_SIZE])
+        starts = range(HEADER_SIZE, KIT_SIZE, SURFACE_SIZE)
+        self._ports = [internal[s] for s in starts]
+        self.surfaces = [Surface(i, internal[s + 1:s + SURFACE_SIZE], self._header, self._ports)
+                         for i, s in enumerate(starts)]
 
     def pad(self, n: int) -> Surface:
-        """1-based pad access: pad(1) .. pad(10)."""
-        assert 1 <= n <= 10
-        return self.surfaces[n - 1]
+        """pad(1) .. pad(10)."""
+        return self.surfaces[_check(n, 1, 10, 'pad') - 1]
 
     def trigger(self, n: int) -> Surface:
-        """1-based trigger access: trigger(1) .. trigger(9)."""
-        assert 1 <= n <= 9
-        return self.surfaces[9 + n]
-
-    def to_internal(self) -> list[int]:
-        data = list(self._header_bytes)     # 117 bytes (0-116)
-        for i, s in enumerate(self.surfaces):
-            data.append(self._ports[i])     # port byte at 117 + i*25
-            data.extend(s.raw())            # 24 data bytes at 118 + i*25
-        return data[:self._internal_size]
-
-    def to_sysex(self) -> bytes:
-        internal = self.to_internal()
-        h = self.sysex_header
-        header = bytes([
-            0xF0,
-            *KAT_MANUFACTURER,
-            DRUMKAT_INSTRUMENT_ID,
-            h.dump_type,
-            h.instrument_id,
-            h.sw_version,
-            h.aux,
-        ])
-        return header + _encode_nibbles(internal) + bytes([0xF7])
+        """trigger(1) .. trigger(9)."""
+        return self.surfaces[_check(n, 1, 9, 'trigger') + 9]
 
     @property
     def name(self) -> str:
-        chars = [_swap_nibbles(self._header_bytes[NAME_OFFSET + i]) for i in range(NAME_LENGTH)]
+        chars = (swap_nibbles(b) for b in self._header[:NAME_LENGTH])
         return ''.join(chr(c) if 32 <= c < 127 else '?' for c in chars).rstrip()
 
     @name.setter
     def name(self, value: str):
-        padded = value[:NAME_LENGTH].ljust(NAME_LENGTH)
-        for i, ch in enumerate(padded):
-            self._header_bytes[NAME_OFFSET + i] = _swap_nibbles(ord(ch))
+        text = value[:NAME_LENGTH].ljust(NAME_LENGTH)
+        self._header[:NAME_LENGTH] = [swap_nibbles(ord(c) if 32 <= ord(c) < 127 else ord('?')) for c in text]
 
     @property
     def tempo(self) -> float:
-        """Kit tempo in BPM.  Formula: BPM = 10000 / nibble_swap(h[66]).
-        Returns a float rounded to 1 decimal place (e.g. 94.3, 109.9, 120.5)."""
-        stored = _swap_nibbles(self._header_bytes[TEMPO_OFFSET])
-        if stored == 0:
-            return TEMPO_MIN
-        return round(10000 / stored, 1)
+        """BPM, to one decimal. Only 216 tempos exist (10000 / 40..255)."""
+        return tempo_from_stored(swap_nibbles(self._header[TEMPO_OFFSET]))
 
     @tempo.setter
     def tempo(self, bpm: float):
-        """Set tempo in BPM.  Clamps to [TEMPO_MIN, TEMPO_MAX]."""
-        bpm = max(TEMPO_MIN, min(TEMPO_MAX, float(bpm)))
-        stored = round(10000 / bpm)
-        stored = max(1, min(255, stored))
-        self._header_bytes[TEMPO_OFFSET] = _swap_nibbles(stored)
+        self._header[TEMPO_OFFSET] = swap_nibbles(tempo_to_stored(bpm))
+
+    def program_change(self, slot: int) -> tuple[int, int | None]:
+        """(channel 1-16, program 0-127 or None) for slot 0-5."""
+        o = PROGRAM_BASE_OFFSET + 2 * _check(slot, 0, NUM_PROGRAM_SLOTS - 1, 'slot')
+        program = swap_nibbles(self._header[o + 1])
+        return (self._header[o] & 0x0F) + 1, program if program < 128 else None
+
+    def set_program_change(self, slot: int, channel: int, program: int | None):
+        o = PROGRAM_BASE_OFFSET + 2 * _check(slot, 0, NUM_PROGRAM_SLOTS - 1, 'slot')
+        self._header[o] = (self._header[o] & 0xF0) | (_check(channel, 1, 16, 'channel') - 1)
+        self._header[o + 1] = swap_nibbles(128 if program is None else _check(program, 0, 127, 'program'))
+
+    def to_internal(self) -> list[int]:
+        data = list(self._header)
+        for port, surface in zip(self._ports, self.surfaces):
+            data.append(port)
+            data += surface.raw()
+        return data
+
+    def to_sysex(self) -> bytes:
+        return _build_sysex(self.sysex_header, self.to_internal())
 
     def __repr__(self):
-        lines = [f'Kit "{self.name}" (sw=0x{self.sysex_header.sw_version:02X})']
-        for s in self.surfaces:
-            lines.append(f'  {s}')
-        return '\n'.join(lines)
+        return '\n'.join([f'Kit "{self.name}" {self.tempo} BPM'] + [f'  {s}' for s in self.surfaces])
+
+
+class KitBank:
+    """All 30 kits from an All Kits dump."""
+
+    def __init__(self, header: SysExHeader, internal: list[int]):
+        if len(internal) != NUM_KITS * KIT_SIZE:
+            raise ValueError(f'All Kits data must be {NUM_KITS * KIT_SIZE} bytes, got {len(internal)}')
+        self.sysex_header = header
+        self.kits = [Kit(SysExHeader(DUMP_TYPE_KIT, header.instrument_id, header.sw_version, i),
+                         internal[i * KIT_SIZE:(i + 1) * KIT_SIZE])
+                     for i in range(NUM_KITS)]
+
+    def kit(self, n: int) -> Kit:
+        """kit(1) .. kit(30)."""
+        return self.kits[_check(n, 1, NUM_KITS, 'kit') - 1]
+
+    def to_sysex(self) -> bytes:
+        return _build_sysex(self.sysex_header, [b for k in self.kits for b in k.to_internal()])
+
+    def __repr__(self):
+        return '\n'.join(['KitBank:'] + [f'  [{i:2d}] {k.name}' for i, k in enumerate(self.kits, 1)])
 
 
 # ---------------------------------------------------------------------------
 # File I/O
 # ---------------------------------------------------------------------------
 
-def load_kit(path: str) -> Kit:
+def load(path: str) -> Kit | KitBank:
+    """Load a single-kit or All Kits dump, whichever the file contains."""
     with open(path, 'rb') as f:
-        raw = f.read()
-    if not raw or raw[0] != 0xF0 or raw[-1] != 0xF7:
-        raise ValueError('Invalid SysEx file (missing F0…F7 framing)')
-    header  = parse_sysex_header(raw)
-    payload = raw[9:-1]
-    internal = _decode_nibbles(payload)
-    return Kit(header, internal)
+        header, internal = parse_sysex(f.read())
+    if header.dump_type == DUMP_TYPE_ALL_KITS:
+        return KitBank(header, internal)
+    if header.dump_type == DUMP_TYPE_KIT:
+        return Kit(header, internal)
+    raise ValueError(f'Unsupported dump type 0x{header.dump_type:02X} (expected a kit or All Kits dump)')
 
 
-def save_kit(kit: Kit, path: str):
-    with open(path, 'wb') as f:
-        f.write(kit.to_sysex())
+def _load_as(path: str, kind: type):
+    obj = load(path)
+    if not isinstance(obj, kind):
+        raise ValueError(f'{path} is not a {kind.__name__} dump')
+    return obj
 
 
-# ---------------------------------------------------------------------------
-# Kit bank (All Kits dump — 30 kits)
-# ---------------------------------------------------------------------------
-
-KIT_SIZE = 592   # internal bytes per kit (= 1184 nibble bytes)
-
-class KitBank:
-    """Holds all 30 kits from an All Kits SysEx dump."""
-
-    def __init__(self, header: SysExHeader, internal: list[int]):
-        self.sysex_header = header
-        expected = NUM_KITS * KIT_SIZE
-        if len(internal) != expected:
-            raise ValueError(
-                f'All Kits dump size mismatch: expected {expected} bytes, '
-                f'got {len(internal)}')
-        self.kits: list[Kit] = []
-        for i in range(NUM_KITS):
-            block = internal[i * KIT_SIZE:(i + 1) * KIT_SIZE]
-            # Build a minimal SysExHeader for each kit slot
-            slot_header = SysExHeader(DUMP_TYPE_KIT, header.instrument_id,
-                                      header.sw_version, i)
-            self.kits.append(Kit(slot_header, block))
-
-    def kit(self, n: int) -> Kit:
-        """1-based kit access: kit(1) .. kit(30)."""
-        assert 1 <= n <= NUM_KITS
-        return self.kits[n - 1]
-
-    def to_internal(self) -> list[int]:
-        data = []
-        for k in self.kits:
-            data.extend(k.to_internal())
-        return data
-
-    def to_sysex(self) -> bytes:
-        internal = self.to_internal()
-        h = self.sysex_header
-        header = bytes([
-            0xF0,
-            *KAT_MANUFACTURER,
-            DRUMKAT_INSTRUMENT_ID,
-            h.dump_type,
-            h.instrument_id,
-            h.sw_version,
-            h.aux,
-        ])
-        return header + _encode_nibbles(internal) + bytes([0xF7])
-
-    def __repr__(self):
-        lines = ['KitBank (30 kits):']
-        for i, k in enumerate(self.kits):
-            lines.append(f'  [{i+1:2d}] {k.name}')
-        return '\n'.join(lines)
+def load_kit(path: str) -> Kit:
+    return _load_as(path, Kit)
 
 
 def load_kit_bank(path: str) -> KitBank:
-    with open(path, 'rb') as f:
-        raw = f.read()
-    if not raw or raw[0] != 0xF0 or raw[-1] != 0xF7:
-        raise ValueError('Invalid SysEx file (missing F0…F7 framing)')
-    header = parse_sysex_header(raw)
-    if header.dump_type != DUMP_TYPE_ALL_KITS:
-        raise ValueError(
-            f'Expected All Kits dump (0x{DUMP_TYPE_ALL_KITS:02X}), '
-            f'got 0x{header.dump_type:02X}')
-    internal = _decode_nibbles(raw[9:-1])
-    return KitBank(header, internal)
+    return _load_as(path, KitBank)
 
 
-def save_kit_bank(bank: KitBank, path: str):
+def save(obj: Kit | KitBank, path: str):
     with open(path, 'wb') as f:
-        f.write(bank.to_sysex())
+        f.write(obj.to_sysex())
 
-
-# ---------------------------------------------------------------------------
-# Quick self-test / demo
-# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     import sys
 
     path = sys.argv[1] if len(sys.argv) > 1 else 'Kit 1.syx'
-    kit = load_kit(path)
-    print(f'Loaded: {path}')
-    print(kit)
-    print()
-
-    # Round-trip check
-    original_raw = open(path, 'rb').read()
-    roundtrip_raw = kit.to_sysex()
-    if original_raw == roundtrip_raw:
-        print('Round-trip check: PASS (byte-for-byte identical)')
-    else:
-        diffs = [(i, a, b) for i, (a, b) in enumerate(zip(original_raw, roundtrip_raw)) if a != b]
-        print(f'Round-trip check: FAIL ({len(diffs)} byte(s) differ)')
-        for i, a, b in diffs[:10]:
-            print(f'  byte {i}: {a:02X} -> {b:02X}')
+    loaded = load(path)
+    print(loaded)
+    with open(path, 'rb') as f:
+        same = f.read() == loaded.to_sysex()
+    print('Round-trip:', 'PASS' if same else 'FAIL')

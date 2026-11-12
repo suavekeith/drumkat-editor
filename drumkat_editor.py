@@ -3,22 +3,23 @@
 import sys
 import rtmidi
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QFormLayout, QSplitter, QListWidget, QListWidgetItem, QLabel,
-    QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QGroupBox, QScrollArea,
+    QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QScrollArea,
     QFileDialog, QMessageBox, QFrame, QPushButton,
 )
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QColor, QFont
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor
 
 from drumkat38 import (
-    Kit, KitBank, load_kit, save_kit, load_kit_bank, save_kit_bank,
-    parse_sysex_header, DUMP_TYPE_KIT, DUMP_TYPE_ALL_KITS,
-    SURFACES, MODE_NAMES, CONTROL_TYPE_NAMES, GATE_TABLE,
-    note_name, NUM_SURFACES, NUM_KITS,
-    MIDI_PORT_NAMES, MODES_WITH_PORT,
-    TEMPO_MIN, TEMPO_MAX,
+    Kit, KitBank, Sound, load, save,
+    SURFACES, MODE_NAMES, CONTROL_TYPE_NAMES, MIDI_PORT_NAMES,
+    MODES_8_NOTES, MODES_WITH_PORT,
+    MODE_NOTE_SHIFT, MODE_GATE_SHIFT, MODE_VELOCITY_SHIFT, MODE_CONTROL,
+    NOTE_OFF, GATE_NO_OFF, TEMPO_MIN, TEMPO_MAX,
+    gate_label, note_name, tempo_from_stored, tempo_to_stored,
 )
+
 
 
 # ---------------------------------------------------------------------------
@@ -44,20 +45,20 @@ class MidiEngine:
             for ch in range(16):
                 self._out.send_message([0xB0 | ch, 123, 0])
 
+    def is_open(self) -> bool:
+        return self._out.is_port_open()
+
     def open(self, idx: int):
-        if self._port == idx:
+        if self._port == idx and self.is_open():
             return
-        if self._out.is_port_open():
-            self._all_notes_off()
-            self._out.close_port()
-        ports = self.ports()
-        if 0 <= idx < len(ports):
+        self.close()
+        if 0 <= idx < len(self.ports()):
             self._out.open_port(idx)
             self._port = idx
 
     def close(self):
         self._all_notes_off()
-        if self._out.is_port_open():
+        if self.is_open():
             self._out.close_port()
         self._port = None
 
@@ -75,13 +76,6 @@ class MidiEngine:
         if callback:
             callback()
 
-
-# ---------------------------------------------------------------------------
-# Mode groupings
-# ---------------------------------------------------------------------------
-
-MODES_4_NOTES = {1, 2, 5, 11, 12, 14, 15}
-MODES_8_NOTES = {9, 10, 13}
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +136,7 @@ QLineEdit {
 QLineEdit:focus { border-color: #0e639c; }
 QLineEdit:disabled { background-color: #2d2d2d; color: #6a6a6a; }
 
-QSpinBox, QComboBox {
+QAbstractSpinBox, QComboBox {
     background-color: #3c3c3c;
     border: 1px solid #555;
     border-radius: 4px;
@@ -150,17 +144,17 @@ QSpinBox, QComboBox {
     color: #d4d4d4;
     min-height: 22px;
 }
-QSpinBox:focus, QComboBox:focus { border-color: #0e639c; }
-QSpinBox:disabled, QComboBox:disabled {
+QAbstractSpinBox:focus, QComboBox:focus { border-color: #0e639c; }
+QAbstractSpinBox:disabled, QComboBox:disabled {
     background-color: #2d2d2d;
     color: #555;
 }
-QSpinBox::up-button, QSpinBox::down-button {
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
     background-color: #4a4a4a;
     border: none;
     width: 16px;
 }
-QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {
     background-color: #0e639c;
 }
 QComboBox::drop-down {
@@ -238,102 +232,141 @@ QFrame#divider {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _gate_labels() -> list[str]:
-    labels = ['Latch']
-    for i in range(1, 254):
-        v = GATE_TABLE[i]
-        labels.append(f'{v:.3f}s' if v is not None else f'?({i})')
-    labels.append('No OFF')
-    return labels
-
-
-GATE_LABELS = _gate_labels()
-VEL_MIN_VALUES = list(range(0, 121, 8))
-VEL_MAX_VALUES = list(range(7, 128, 8))
+GATE_LABELS = [gate_label(i) for i in range(GATE_NO_OFF + 1)]
+HAT_OPEN_LABELS = ['Open', 'Closed', 'Closed 2', 'Sound 4']
 
 # Surface list colors
 PAD_COLOR     = QColor('#1a3a4a')   # dark teal tint for pads
 TRIGGER_COLOR = QColor('#3a2a1a')   # dark amber tint for triggers
 
 
+def _spin(lo: int, hi: int) -> QSpinBox:
+    spin = QSpinBox()
+    spin.setRange(lo, hi)
+    spin.setFixedWidth(54)
+    return spin
+
+
+def _combo(items, width: int | None = None) -> QComboBox:
+    combo = QComboBox()
+    combo.addItems(list(items))
+    combo.setMaxVisibleItems(16)
+    if width:
+        combo.setFixedWidth(width)
+    return combo
+
+
+class TempoSpin(QDoubleSpinBox):
+    """Tempo editor whose arrows step through the tempos the unit can store."""
+
+    def __init__(self):
+        super().__init__()
+        self.setRange(TEMPO_MIN, TEMPO_MAX)
+        self.setDecimals(1)
+        self.setSuffix(' BPM')
+        self.setKeyboardTracking(False)     # don't snap while the user is typing
+
+    def stepBy(self, steps: int):
+        self.setValue(tempo_from_stored(tempo_to_stored(self.value()) - steps))
+
+
 # ---------------------------------------------------------------------------
 # Surface parameter panel
 # ---------------------------------------------------------------------------
 
+# Column name -> header text, in grid order.
+COLUMNS = {
+    'label': '', 'channel': 'Ch', 'note': 'Note', 'note_name': '', 'test': '',
+    'vel_min': 'Vel min', 'vel_max': 'Vel max', 'curve': 'Curve', 'gate': 'Gate',
+    'port': 'MIDI out', 'dyn_min': 'Hit from', 'dyn_max': 'Hit to',
+}
+NOTE_COLUMNS = {'label', 'channel', 'note', 'note_name', 'test'}
+SOUND_COLUMNS = NOTE_COLUMNS | {'vel_min', 'vel_max', 'curve', 'gate'}
+
+
+class VoiceRow:
+    """Editors for one sound (or one extra note of an 8-note mode) on a grid row."""
+
+    def __init__(self, panel: 'SurfacePanel', grid: QGridLayout, row: int):
+        self._panel = panel
+        self._slot = None
+        note_name_label = QLabel()
+        note_name_label.setMinimumWidth(40)
+        note_name_label.setStyleSheet('color: #4ec9b0; font-weight: bold;')
+        test = QPushButton('▶')
+        test.setObjectName('testBtn')
+        test.setFixedWidth(28)
+        test.clicked.connect(self._play)
+        self.w = {
+            'label': QLabel(), 'channel': _spin(1, 16), 'note': _spin(0, NOTE_OFF),
+            'note_name': note_name_label, 'test': test,
+            'vel_min': _combo((str(v) for v in range(0, 121, 8)), 60),
+            'vel_max': _combo((str(v) for v in range(7, 128, 8)), 60),
+            'curve': _spin(1, 16), 'gate': _combo(GATE_LABELS, 86),
+            'port': _combo(MIDI_PORT_NAMES, 70),
+            'dyn_min': _spin(0, 127), 'dyn_max': _spin(0, 127),
+        }
+        for col, name in enumerate(COLUMNS):
+            grid.addWidget(self.w[name], row, col)
+
+        for name in ('channel', 'curve', 'dyn_min', 'dyn_max'):
+            self.w[name].valueChanged.connect(lambda v, n=name: self._set(n, v))
+        for name in ('gate', 'port'):
+            self.w[name].currentIndexChanged.connect(lambda i, n=name: self._set(n, i))
+        self.w['vel_min'].currentIndexChanged.connect(lambda i: self._set('vel_min', i * 8))
+        self.w['vel_max'].currentIndexChanged.connect(lambda i: self._set('vel_max', i * 8 + 7))
+        self.w['note'].valueChanged.connect(self._note_changed)
+
+    def _set(self, attr: str, value: int):
+        if self._slot is not None and not self._panel.loading:
+            setattr(self._slot, attr, value)
+            self._panel.changed.emit()
+
+    def _note_changed(self, value: int):
+        self.w['note_name'].setText(note_name(value))
+        self._set('note', value)
+
+    def _play(self):
+        midi, slot, btn = self._panel.midi, self._slot, self.w['test']
+        if slot is None or slot.note == NOTE_OFF or not midi.is_open():
+            return
+        btn.setEnabled(False)
+        midi.play(slot.channel, slot.note, lambda: btn.setEnabled(True))
+
+    def show(self, slot, label: str, columns: set[str]):
+        """Bind this row to `slot` and show only `columns`. Caller sets panel.loading."""
+        self._slot = slot
+        w = self.w
+        w['label'].setText(label)
+        w['channel'].setValue(slot.channel)
+        w['note'].setValue(slot.note)
+        w['note_name'].setText(note_name(slot.note))
+        if isinstance(slot, Sound):
+            w['vel_min'].setCurrentIndex(slot.vel_min // 8)
+            w['vel_max'].setCurrentIndex(slot.vel_max // 8)
+            w['curve'].setValue(slot.curve)
+            w['gate'].setCurrentIndex(slot.gate)
+            w['port'].setCurrentIndex(slot.port)
+            w['dyn_min'].setValue(slot.dyn_min)
+            w['dyn_max'].setValue(slot.dyn_max)
+        for name, widget in w.items():
+            widget.setVisible(name in columns)
+
+    def hide(self):
+        self._slot = None
+        for widget in self.w.values():
+            widget.hide()
+
+
 class SurfacePanel(QWidget):
-    def __init__(self, midi: 'MidiEngine', parent=None):
+    changed = pyqtSignal()      # emitted after any edit to the surface
+
+    def __init__(self, midi: MidiEngine, parent=None):
         super().__init__(parent)
+        self.midi = midi
+        self.loading = False
         self._surface = None
-        self._loading = False
-        self._midi    = midi
         self._build_ui()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _make_note_spin():
-        spin = QSpinBox()
-        spin.setRange(0, 127)
-        spin.setFixedWidth(64)
-        return spin
-
-    def _make_test_btn(self, note_getter):
-        """Create a ▶ button that plays the note returned by note_getter()."""
-        btn = QPushButton('▶')
-        btn.setObjectName('testBtn')
-        btn.setFixedWidth(28)
-
-        def on_click():
-            if self._surface is None or not self._midi.ports():
-                return
-            btn.setProperty('playing', 'true')
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-            btn.setEnabled(False)
-            self._midi.play(
-                self._surface.channel,
-                note_getter(),
-                callback_note_off=lambda: self._reset_btn(btn),
-            )
-
-        btn.clicked.connect(on_click)
-        return btn
-
-    def _reset_btn(self, btn):
-        btn.setProperty('playing', 'false')
-        btn.style().unpolish(btn)
-        btn.style().polish(btn)
-        btn.setEnabled(True)
-
-    def _note_widget(self, spin, label, note_getter=None):
-        w = QWidget()
-        h = QHBoxLayout(w)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(8)
-        h.addWidget(spin)
-        h.addWidget(label)
-        if note_getter is not None:
-            h.addWidget(self._make_test_btn(note_getter))
-        h.addStretch()
-        return w
-
-    def _add_note_row(self, form, row_label, mapped=True):
-        spin  = self._make_note_spin()
-        label = QLabel('---')
-        label.setMinimumWidth(48)
-        label.setObjectName('noteLabel')
-        if not mapped:
-            spin.setEnabled(False)
-            spin.setToolTip('Block position not yet mapped')
-            label.setText('TBD')
-        form.addRow(row_label, self._note_widget(spin, label))
-        return spin, label
-
-    # ------------------------------------------------------------------
-    # Build
-    # ------------------------------------------------------------------
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -341,9 +374,7 @@ class SurfacePanel(QWidget):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        # Surface name heading
         self.l_surface_name = QLabel('')
-        self.l_surface_name.setObjectName('heading')
         font = self.l_surface_name.font()
         font.setPointSize(15)
         font.setBold(True)
@@ -352,317 +383,114 @@ class SurfacePanel(QWidget):
         root.addWidget(self.l_surface_name)
 
         divider = QFrame()
-        divider.setObjectName('divider')
         divider.setFrameShape(QFrame.Shape.HLine)
         divider.setStyleSheet('background-color: #3a3a3a; max-height: 1px; border: none;')
         root.addWidget(divider)
 
-        # ---- Main form ----
-        form = QFormLayout()
+        self._form = form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         form.setVerticalSpacing(8)
         form.setHorizontalSpacing(12)
 
-        self.w_mode = QComboBox()
-        self.w_mode.addItems(MODE_NAMES)
+        self.w_mode = _combo(MODE_NAMES, 200)
         self.w_mode.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow('Mode:', self.w_mode)
 
-        self.w_channel = QSpinBox()
-        self.w_channel.setRange(1, 16)
-        self.w_channel.setFixedWidth(64)
-        self.w_channel.valueChanged.connect(self._on_channel_changed)
-        form.addRow('MIDI Channel:', self.w_channel)
+        self.w_control_type = _combo(CONTROL_TYPE_NAMES, 200)
+        self.w_control_type.currentIndexChanged.connect(lambda i: self._set('control_type', i))
+        form.addRow('Control Type:', self.w_control_type)
 
-        self.w_curve = QSpinBox()
-        self.w_curve.setRange(1, 16)
-        self.w_curve.setFixedWidth(64)
-        self.w_curve.valueChanged.connect(self._on_curve_changed)
-        form.addRow('Velocity Curve:', self.w_curve)
+        self.w_shift_note = _spin(0, 127)
+        self.w_shift_note.valueChanged.connect(lambda v: self._set('shift_end', v))
+        form.addRow('Shift up to note:', self.w_shift_note)
 
-        # Note 1 with prominent name label
-        self.w_note = self._make_note_spin()
-        self.l_note = QLabel('---')
-        self.l_note.setMinimumWidth(48)
-        self.l_note.setStyleSheet('color: #4ec9b0; font-weight: bold; font-size: 14px;')
-        self.w_note.valueChanged.connect(self._on_note_changed)
-        form.addRow('Note 1:', self._note_widget(self.w_note, self.l_note,
-                                                  lambda: self.w_note.value()))
-
-        # Vel Min + Max on same row
-        vel_widget = QWidget()
-        vel_layout = QHBoxLayout(vel_widget)
-        vel_layout.setContentsMargins(0, 0, 0, 0)
-        vel_layout.setSpacing(8)
-        self.w_vel_min = QComboBox()
-        self.w_vel_min.addItems([str(v) for v in VEL_MIN_VALUES])
-        self.w_vel_min.setFixedWidth(72)
-        self.w_vel_min.currentIndexChanged.connect(self._on_vel_min_changed)
-        lbl_to = QLabel('→')
-        lbl_to.setStyleSheet('color: #555; font-size: 16px;')
-        self.w_vel_max = QComboBox()
-        self.w_vel_max.addItems([str(v) for v in VEL_MAX_VALUES])
-        self.w_vel_max.setFixedWidth(72)
-        self.w_vel_max.currentIndexChanged.connect(self._on_vel_max_changed)
-        vel_layout.addWidget(self.w_vel_min)
-        vel_layout.addWidget(lbl_to)
-        vel_layout.addWidget(self.w_vel_max)
-        vel_layout.addStretch()
-        form.addRow('Velocity:', vel_widget)
-
-        self.w_gate = QComboBox()
-        self.w_gate.addItems(GATE_LABELS)
-        self.w_gate.setMaxVisibleItems(16)
-        self.w_gate.currentIndexChanged.connect(self._on_gate_changed)
-        form.addRow('Gate Time:', self.w_gate)
-
-        # MIDI Port (not available in Simple or Control mode)
-        self.w_midi_port = QComboBox()
-        self.w_midi_port.addItems(MIDI_PORT_NAMES)
-        self.w_midi_port.currentIndexChanged.connect(self._on_midi_port_setting_changed)
-        self.l_midi_port = QLabel('MIDI Port:')
-        form.addRow(self.l_midi_port, self.w_midi_port)
-
-        # Control Type (Control mode only)
-        self.w_control_type = QComboBox()
-        self.w_control_type.addItems(CONTROL_TYPE_NAMES)
-        self.w_control_type.currentIndexChanged.connect(self._on_control_type_changed)
-        self.l_control_type = QLabel('Control Type:')
-        form.addRow(self.l_control_type, self.w_control_type)
+        self.w_shift_gate = _combo(GATE_LABELS, 92)
+        self.w_shift_gate.currentIndexChanged.connect(lambda i: self._set('shift_end', i))
+        form.addRow('Shift up to gate:', self.w_shift_gate)
 
         self.w_link = QComboBox()
-        self.w_link.currentIndexChanged.connect(self._on_link_changed)
+        self.w_link.setFixedWidth(200)
+        self.w_link.currentIndexChanged.connect(
+            lambda i: self._set('link', self.w_link.itemData(i)))
         form.addRow('Link To:', self.w_link)
-
         root.addLayout(form)
 
-        # ---- Additional notes group ----
-        self.notes_group = QGroupBox('Additional Notes')
-        nf = QFormLayout(self.notes_group)
-        nf.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        nf.setVerticalSpacing(8)
-        nf.setHorizontalSpacing(12)
-        nf.setContentsMargins(12, 16, 12, 12)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        self._headers = {}
+        for col, (name, text) in enumerate(COLUMNS.items()):
+            self._headers[name] = QLabel(text)
+            grid.addWidget(self._headers[name], 0, col)
+        self._rows = [VoiceRow(self, grid, r + 1) for r in range(8)]
+        grid.setColumnStretch(len(COLUMNS), 1)
+        root.addLayout(grid)
+        self.clear()
 
-        def _make_note_label():
-            lbl = QLabel('---')
-            lbl.setMinimumWidth(48)
-            lbl.setStyleSheet('color: #4ec9b0; font-weight: bold;')
-            return lbl
+    def _set(self, attr: str, value):
+        if self._surface is not None and not self.loading:
+            setattr(self._surface, attr, value)
+            self.changed.emit()
 
-        def _note_row(form, row_label):
-            spin  = self._make_note_spin()
-            label = _make_note_label()
-            form.addRow(row_label, self._note_widget(spin, label, lambda s=spin: s.value()))
-            return spin, label
-
-        self.w_note2, self.l_note2 = _note_row(nf, 'Note 2:')
-        self.w_note3, self.l_note3 = _note_row(nf, 'Note 3:')
-        self.w_note4, self.l_note4 = _note_row(nf, 'Note 4:')
-
-        # Divider between 4-note and 8-note section
-        self.notes_divider = QFrame()
-        self.notes_divider.setFrameShape(QFrame.Shape.HLine)
-        self.notes_divider.setStyleSheet('background-color: #3a3a3a; max-height: 1px; border: none;')
-        nf.addRow(self.notes_divider)
-
-        self.w_note5, self.l_note5 = _note_row(nf, 'Note 5:')
-        self.w_note6, self.l_note6 = _note_row(nf, 'Note 6:')
-        self.w_note7, self.l_note7 = _note_row(nf, 'Note 7:')
-        self.w_note8, self.l_note8 = _note_row(nf, 'Note 8:')
-
-        # Store row widgets for show/hide (grab from form)
-        self._note58_widgets = [self.w_note5, self.l_note5,
-                                 self.w_note6, self.l_note6,
-                                 self.w_note7, self.l_note7,
-                                 self.w_note8, self.l_note8,
-                                 self.notes_divider]
-
-        for spin, handler in [
-            (self.w_note2, self._on_note2_changed),
-            (self.w_note3, self._on_note3_changed),
-            (self.w_note4, self._on_note4_changed),
-            (self.w_note5, self._on_note5_changed),
-            (self.w_note6, self._on_note6_changed),
-            (self.w_note7, self._on_note7_changed),
-            (self.w_note8, self._on_note8_changed),
-        ]:
-            spin.valueChanged.connect(handler)
-
-        root.addWidget(self.notes_group)
-        self.notes_group.hide()
-        self.setEnabled(False)
-
-    # ------------------------------------------------------------------
-    # Load
-    # ------------------------------------------------------------------
-
-    def load_surface(self, surface):
-        self._surface = surface
-        self._loading = True
-        self.setEnabled(True)
-
-        self.l_surface_name.setText(surface.name)
-        self.w_mode.setCurrentIndex(surface.mode)
-        self.w_channel.setValue(surface.channel)
-        self.w_curve.setValue(surface.curve)
-        self._set_note(self.w_note, self.l_note, surface.note)
-        # Use get() via dict to avoid ValueError on unusual stored bytes
-        vmin_idx = VEL_MIN_VALUES.index(surface.vel_min) if surface.vel_min in VEL_MIN_VALUES else 0
-        vmax_idx = VEL_MAX_VALUES.index(surface.vel_max) if surface.vel_max in VEL_MAX_VALUES else len(VEL_MAX_VALUES) - 1
-        self.w_vel_min.setCurrentIndex(vmin_idx)
-        self.w_vel_max.setCurrentIndex(vmax_idx)
-        self.w_gate.setCurrentIndex(surface.gate)
-        self.w_midi_port.setCurrentIndex(surface.midi_port)
-
-        self.w_link.blockSignals(True)
-        self.w_link.clear()
-        self.w_link.addItem('None', userData=None)
-        for i, name in enumerate(SURFACES):
-            if i != surface.index:
-                self.w_link.addItem(name, userData=i)
-        link = surface.link
-        for j in range(self.w_link.count()):
-            if self.w_link.itemData(j) == link:
-                self.w_link.setCurrentIndex(j)
-                break
-        self.w_link.blockSignals(False)
-
-        self._set_note(self.w_note2, self.l_note2, surface.note2)
-        self._set_note(self.w_note3, self.l_note3, surface.note3)
-        self._set_note(self.w_note4, self.l_note4, surface.note4)
-        self._set_note(self.w_note5, self.l_note5, surface.note5)
-        self._set_note(self.w_note6, self.l_note6, surface.note6)
-        self._set_note(self.w_note7, self.l_note7, surface.note7)
-        self._set_note(self.w_note8, self.l_note8, surface.note8)
-
-        ct = surface.control_type
-        self.w_control_type.setCurrentIndex(ct if 0 <= ct < len(CONTROL_TYPE_NAMES) else 0)
-
-        self._refresh_mode_widgets()
-        self._loading = False
+    def _on_mode_changed(self, idx: int):
+        if self._surface is not None and not self.loading:
+            self._surface.mode = idx
+            self.changed.emit()
+            self.load_surface(self._surface)
 
     def clear(self):
         self._surface = None
         self.l_surface_name.setText('')
         self.setEnabled(False)
-        self.notes_group.hide()
-        self.l_control_type.hide()
-        self.w_control_type.hide()
-        self.l_midi_port.hide()
-        self.w_midi_port.hide()
 
-    @staticmethod
-    def _set_note(spin, label, midi_note):
-        spin.setValue(midi_note)
-        label.setText(note_name(midi_note))
+    def load_surface(self, surface):
+        self._surface = surface
+        self.loading = True
+        try:
+            self._load(surface)
+        finally:
+            self.loading = False
+        self.setEnabled(True)
 
-    def _refresh_mode_widgets(self):
-        if self._surface is None:
-            self.notes_group.hide()
-            self.l_control_type.hide()
-            self.w_control_type.hide()
-            return
+    def _load(self, s):
+        mode = s.mode
+        self.l_surface_name.setText(s.name)
+        self.w_mode.setCurrentIndex(mode if mode < len(MODE_NAMES) else -1)
 
-        mode = self._surface.mode
-        is_control = (mode == 16)
+        ct = s.control_type
+        self.w_control_type.setCurrentIndex(ct if ct < len(CONTROL_TYPE_NAMES) else -1)
+        self.w_shift_note.setValue(min(s.shift_end, 127))
+        self.w_shift_gate.setCurrentIndex(min(s.shift_end, GATE_NO_OFF))
+        self._form.setRowVisible(self.w_control_type, mode == MODE_CONTROL)
+        self._form.setRowVisible(self.w_shift_note, mode == MODE_NOTE_SHIFT)
+        self._form.setRowVisible(self.w_shift_gate, mode == MODE_GATE_SHIFT)
 
-        self.l_control_type.setVisible(is_control)
-        self.w_control_type.setVisible(is_control)
+        self.w_link.clear()
+        self.w_link.addItem('None', userData=None)
+        for i, name in enumerate(SURFACES):
+            if i != s.index:
+                self.w_link.addItem(name, userData=i)
+        self.w_link.setCurrentIndex(max(self.w_link.findData(s.link), 0))
 
-        has_port = mode in MODES_WITH_PORT
-        self.l_midi_port.setVisible(has_port)
-        self.w_midi_port.setVisible(has_port)
-
-        if is_control:
-            self.notes_group.hide()
-        elif mode in MODES_8_NOTES:
-            self.notes_group.setTitle('Additional Notes')
-            self.notes_group.show()
-            for w in self._note58_widgets:
-                w.show()
-        elif mode in MODES_4_NOTES:
-            self.notes_group.setTitle('Additional Notes')
-            self.notes_group.show()
-            for w in self._note58_widgets:
-                w.hide()
+        # Sound rows: every mode has sound 1; the multi-note modes add rows.
+        sound_cols = set(SOUND_COLUMNS)
+        if mode in MODES_WITH_PORT:
+            sound_cols.add('port')
+        if mode == MODE_VELOCITY_SHIFT:
+            sound_cols |= {'dyn_min', 'dyn_max'}
+        slots = s.slots
+        if mode in MODES_8_NOTES:
+            labels = [f'Note {n}' for n in range(1, 9)]
+        elif mode == 6:
+            labels = HAT_OPEN_LABELS
         else:
-            self.notes_group.hide()
-
-    # ------------------------------------------------------------------
-    # Handlers
-    # ------------------------------------------------------------------
-
-    def _on_mode_changed(self, idx):
-        if self._loading or self._surface is None: return
-        self._surface.mode = idx
-        self._refresh_mode_widgets()
-
-    def _on_channel_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.channel = val
-
-    def _on_curve_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.curve = val
-
-    def _on_note_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.note = val
-        self.l_note.setText(note_name(val))
-
-    def _on_vel_min_changed(self, idx):
-        if self._loading or self._surface is None: return
-        self._surface.vel_min = VEL_MIN_VALUES[idx]
-
-    def _on_vel_max_changed(self, idx):
-        if self._loading or self._surface is None: return
-        self._surface.vel_max = VEL_MAX_VALUES[idx]
-
-    def _on_gate_changed(self, idx):
-        if self._loading or self._surface is None: return
-        self._surface.gate = idx
-
-    def _on_control_type_changed(self, idx):
-        if self._loading or self._surface is None: return
-        self._surface.control_type = idx
-
-    def _on_midi_port_setting_changed(self, idx):
-        if self._loading or self._surface is None: return
-        self._surface.midi_port = idx
-
-    def _on_link_changed(self, idx):
-        if self._loading or self._surface is None: return
-        self._surface.link = self.w_link.itemData(idx)
-
-    def _on_note2_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.note2 = val; self.l_note2.setText(note_name(val))
-
-    def _on_note3_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.note3 = val; self.l_note3.setText(note_name(val))
-
-    def _on_note4_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.note4 = val; self.l_note4.setText(note_name(val))
-
-    def _on_note5_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.note5 = val; self.l_note5.setText(note_name(val))
-
-    def _on_note6_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.note6 = val; self.l_note6.setText(note_name(val))
-
-    def _on_note7_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.note7 = val; self.l_note7.setText(note_name(val))
-
-    def _on_note8_changed(self, val):
-        if self._loading or self._surface is None: return
-        self._surface.note8 = val; self.l_note8.setText(note_name(val))
+            labels = [f'Sound {n}' for n in range(1, 5)] if len(slots) > 1 else ['']
+        for row, slot, label in zip(self._rows, slots, labels):
+            row.show(slot, label, sound_cols if isinstance(slot, Sound) else NOTE_COLUMNS)
+        for row in self._rows[len(slots):]:
+            row.hide()
+        for name, header in self._headers.items():
+            header.setVisible(name in sound_cols)
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +506,7 @@ class MainWindow(QMainWindow):
         self._unsaved = False
         self._midi = MidiEngine()
         self.setWindowTitle('drumKAT 3.8 Editor')
-        self.resize(820, 660)
+        self.resize(1100, 660)
         self._build_ui()
         self._build_menu()
         self._refresh_midi_ports()   # auto-open first port if available
@@ -711,11 +539,7 @@ class MainWindow(QMainWindow):
 
         lbl_tempo = QLabel('Tempo:')
         lbl_tempo.setStyleSheet('color: #9d9d9d;')
-        self.w_tempo = QDoubleSpinBox()
-        self.w_tempo.setRange(TEMPO_MIN, TEMPO_MAX)
-        self.w_tempo.setDecimals(1)
-        self.w_tempo.setSingleStep(1.0)
-        self.w_tempo.setSuffix(' BPM')
+        self.w_tempo = TempoSpin()
         self.w_tempo.setFixedWidth(100)
         self.w_tempo.setEnabled(False)
         self.w_tempo.valueChanged.connect(self._on_tempo_changed)
@@ -774,6 +598,7 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet('QScrollArea { background-color: #1e1e1e; border: none; }')
         self.surface_panel = SurfacePanel(self._midi)
+        self.surface_panel.changed.connect(self._mark_unsaved)
         scroll.setWidget(self.surface_panel)
         splitter.addWidget(scroll)
         splitter.setStretchFactor(1, 1)
@@ -844,23 +669,18 @@ class MainWindow(QMainWindow):
             return
         path, _ = QFileDialog.getOpenFileName(
             self, 'Open SysEx File', '', 'SysEx Files (*.syx);;All Files (*)')
-        if not path:
-            return
+        if path:
+            self.load_path(path)
+
+    def load_path(self, path: str):
         try:
-            with open(path, 'rb') as f:
-                raw = f.read()
-            hdr = parse_sysex_header(raw)
-            if hdr.dump_type == DUMP_TYPE_ALL_KITS:
-                bank = load_kit_bank(path)
-                self._bank = bank
-                self._kit  = bank.kits[0]
-            else:
-                self._bank = None
-                self._kit  = load_kit(path)
-        except Exception as e:
+            loaded = load(path)
+        except (OSError, ValueError) as e:
             QMessageBox.critical(self, 'Error', f'Failed to load file:\n{e}')
             return
-        self._path    = path
+        self._bank = loaded if isinstance(loaded, KitBank) else None
+        self._kit = loaded.kits[0] if self._bank else loaded
+        self._path = path
         self._unsaved = False
         self._populate_kit()
 
@@ -869,9 +689,7 @@ class MainWindow(QMainWindow):
             return
         self._kit = self._bank.kits[idx]
         self.w_kit_name.setText(self._kit.name)
-        self.w_tempo.blockSignals(True)
-        self.w_tempo.setValue(self._kit.tempo)
-        self.w_tempo.blockSignals(False)
+        self._show_tempo()
         row = self.surface_list.currentRow()
         self._on_surface_selected(row if row >= 0 else 0)
 
@@ -885,19 +703,16 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self, 'Save SysEx', self._path or '',
             'SysEx Files (*.syx);;All Files (*)')
-        if not path: return
-        self._path = path
-        self._write_kit(path)
+        if path:
+            self._write_kit(path)
 
     def _write_kit(self, path):
         try:
-            if self._bank is not None:
-                save_kit_bank(self._bank, path)
-            else:
-                save_kit(self._kit, path)
-        except Exception as e:
+            save(self._bank or self._kit, path)
+        except OSError as e:
             QMessageBox.critical(self, 'Error', f'Failed to save:\n{e}')
             return
+        self._path = path
         self._unsaved = False
         self._update_title()
         self.statusBar().showMessage(f'Saved: {path}')
@@ -927,9 +742,7 @@ class MainWindow(QMainWindow):
         self.w_kit_name.setEnabled(True)
         self.w_kit_name.setText(self._kit.name)
         self.w_tempo.setEnabled(True)
-        self.w_tempo.blockSignals(True)
-        self.w_tempo.setValue(self._kit.tempo)
-        self.w_tempo.blockSignals(False)
+        self._show_tempo()
         if self.surface_list.currentRow() == 0:
             self._on_surface_selected(0)
         else:
@@ -957,15 +770,13 @@ class MainWindow(QMainWindow):
     def _on_tempo_changed(self, value):
         if self._kit is None: return
         self._kit.tempo = value
-        # Snap the spinbox to the actually-stored value so the display always
-        # reflects what will be written to the hardware (integer quantisation
-        # means 120.0 BPM stores as 120.5, etc.)
-        canonical = self._kit.tempo
-        if canonical != value:
-            self.w_tempo.blockSignals(True)
-            self.w_tempo.setValue(canonical)
-            self.w_tempo.blockSignals(False)
+        self._show_tempo()      # snap to the tempo the unit will actually store
         self._mark_unsaved()
+
+    def _show_tempo(self):
+        self.w_tempo.blockSignals(True)
+        self.w_tempo.setValue(self._kit.tempo)
+        self.w_tempo.blockSignals(False)
 
     def _mark_unsaved(self):
         if not self._unsaved:
@@ -998,18 +809,6 @@ if __name__ == '__main__':
     win.show()
 
     if len(sys.argv) > 1:
-        try:
-            with open(sys.argv[1], 'rb') as f:
-                raw = f.read()
-            hdr = parse_sysex_header(raw)
-            if hdr.dump_type == DUMP_TYPE_ALL_KITS:
-                win._bank = load_kit_bank(sys.argv[1])
-                win._kit  = win._bank.kits[0]
-            else:
-                win._kit = load_kit(sys.argv[1])
-            win._path = sys.argv[1]
-            win._populate_kit()
-        except Exception as e:
-            print(f'Error loading {sys.argv[1]}: {e}')
+        win.load_path(sys.argv[1])
 
     sys.exit(app.exec())
